@@ -52,6 +52,13 @@ from specforge.utils import (
     rank_0_priority,
 )
 
+def count_parameters(model: nn.Module) -> Tuple[int, int]:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+def get_gpu_memory_gb() -> float:
+    return torch.cuda.memory_allocated() / 1e9
 
 def parse_args() -> Tuple[ArgumentParser, Namespace]:
     """
@@ -364,6 +371,10 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
+
+    total_params, trainable_params = count_parameters(draft_model)
+    print_on_rank0(f"\nDRAFT MODEL: {total_params/1e6:.1f}M params ({trainable_params/1e6:.1f}M trainable), GPU: {get_gpu_memory_gb():.1f}GB")
+
     return draft_model_config, draft_model
 
 
@@ -634,6 +645,11 @@ def main():
         args, draft_model_config, processor
     )
 
+    # ADD AFTER:
+    print_on_rank0(f"TRAINING: {len(train_dataloader.dataset):,} samples, {len(train_dataloader)} steps/epoch, {args.total_steps} total steps")
+    print_on_rank0(f"CONFIG: lr={args.learning_rate}, batch={args.target_batch_size}x{args.draft_accumulation_steps}, world={dist.get_world_size()} (TP={args.tp_size})")
+
+
     # we load the vocab mapping then
     draft_model.load_vocab_mapping(vocab_mapping_path)
     print_with_rank("Loaded vocab mapping")
@@ -764,18 +780,22 @@ def main():
                     args, acces, plosses, global_step, tracker, optimizer, mode="train"
                 )
 
-            if dist.get_rank() == 0:
-                time_per_step = time.time() - last_time
-                last_time = time.time()
-                avg_loss = sum(pl for pl in plosses) / len(plosses)
-                avg_acc = sum(acces) / len(acces)
-                progress_bar.set_postfix(
-                    {
-                        "loss": f"{avg_loss:.2f}",
-                        "acc": f"{avg_acc:.2f}",
-                        "time": f"{time_per_step:.2f}s",
-                    }
+            # REPLACE WITH:
+            time_per_step = time.time() - last_time
+            last_time = time.time()
+            avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
+            avg_acc = sum(acc.item() for acc in acces) / len(acces)
+
+            if global_step % args.log_interval == 0:
+                print_on_rank0(
+                    f"[{global_step:>6}/{args.total_steps}] "
+                    f"loss={avg_loss:.4f} acc={avg_acc:.1%} "
+                    f"lr={optimizer.get_learning_rate():.2e} "
+                    f"t={time_per_step:.1f}s gpu={get_gpu_memory_gb():.1f}GB"
                 )
+
+            if dist.get_rank() == 0:
+                progress_bar.set_postfix({"loss": f"{avg_loss:.3f}", "acc": f"{avg_acc:.1%}"})
 
             # ================================================
             # 7.2 Evaluation Step
