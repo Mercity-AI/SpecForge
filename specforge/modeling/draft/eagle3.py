@@ -15,15 +15,40 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.modelling.draft.mla_flex_attention import (
+from specforge.modeling.draft.mla_flex_attention import (
     compile_mla_flex_attention,
     compile_block_mask,
-    generate_eagle3_mask
 )
 
 from specforge.utils import print_with_rank
 from .base import Eagle3DraftModel
 
+def prepare_decoder_attention_mask(
+    attention_mask, input_shape, inputs_embeds, past_key_values_length
+):
+    # create causal mask
+    # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+    combined_attention_mask = None
+    if input_shape[-1] > 1:
+        combined_attention_mask = _make_causal_mask(
+            input_shape,
+            inputs_embeds.dtype,
+            device=inputs_embeds.device,
+            past_key_values_length=past_key_values_length,
+        )
+
+    if attention_mask is not None:
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        expanded_attn_mask = _expand_mask(
+            attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]
+        ).to(inputs_embeds.device)
+        combined_attention_mask = (
+            expanded_attn_mask
+            if combined_attention_mask is None
+            else expanded_attn_mask + combined_attention_mask
+        )
+
+    return combined_attention_mask
 
 def _make_causal_mask(
     input_ids_shape: torch.Size,
@@ -106,18 +131,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
 
 def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
     """Apply RoPE to a single tensor (Q or K separately)."""
+    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
     cos = cos[position_ids].unsqueeze(1)  # [B, 1, S, D]
     sin = sin[position_ids].unsqueeze(1)
-    
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    
-    rotated = torch.stack([
-        x1 * cos[..., ::2] - x2 * sin[..., ::2],
-        x1 * sin[..., 1::2] + x2 * cos[..., 1::2]
-    ], dim=-1).flatten(-2)
-    
-    return rotated
+    return (x * cos) + (rotate_half(x) * sin)
+
 
 class EagleMLP(nn.Module):
     def __init__(self, config):
@@ -430,203 +449,279 @@ class EagleAttention(nn.Module):
 
 class EagleFlexMLA(nn.Module):
     """
-    Multi-Head Latent Attention with FlexAttention.
+    Multi-Head Latent Attention with FlexAttention for EAGLE3.
     
-    Key difference from standard attention:
-    - Instead of caching K, V directly, we cache the compressed latent c_kv
-    - K, V are decompressed on-the-fly during attention
-    - Significantly reduced KV cache size: (H * head_dim * 2) → latent_dim
+    Key differences from EagleAttention:
+    - Compresses KV to latent space before caching
+    - Decompresses on-the-fly during attention
+    - Uses FlexAttention with EAGLE3 mask for tree speculation
+    
+    Cache savings: (H * head_dim * 2) → latent_dim
     """
 
     def __init__(self, config, layer_idx: Optional[int] = None):
-        super().__init__(config, layer_idx)
+        super().__init__()  # Fixed: nn.Module takes no args
+        
+        self.config = config
+        self.layer_idx = layer_idx  # Fixed: store layer_idx
         
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
-        self.num_key_value_heads = config.num_key_value_heads
         
-        # MLA latent dimensions (configurable, defaults to 1/4 of KV size)
+        if hasattr(config, "head_dim"):
+            self.head_dim = config.head_dim
+        else:
+            self.head_dim = self.hidden_size // self.num_heads
+            
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        
+        # MLA latent dimensions
         self.latent_dim = getattr(
             config, 
             'mla_latent_dim', 
             self.num_key_value_heads * self.head_dim // 4
         )
-        self.q_latent_dim = getattr(
-            config,
-            'mla_q_latent_dim',
-            self.latent_dim
+        
+        # Whether to use decoupled RoPE
+        self.rope_dim = getattr(config, 'mla_rope_dim', 0)
+        
+        # === Query path (takes concatenated input like EagleAttention) ===
+        # Input is hidden_size * 2 because of torch.cat((input_emb, hidden_states), dim=-1)
+        self.q_proj = nn.Linear(
+            self.hidden_size * 2, 
+            self.num_heads * self.head_dim, 
+            bias=False
         )
         
-        # === Query path ===
-        # Option A: Direct projection (no compression for Q)
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        
-
-        # === Key-Value path (MLA's core innovation) ===
-        # Down-project to shared latent
-        self.W_dkv = nn.Linear(self.hidden_size, self.latent_dim, bias=False)
-        # Up-project to K and V separately
-        self.W_uk = nn.Linear(self.latent_dim, self.num_key_value_heads * self.head_dim, bias=False)
-        self.W_uv = nn.Linear(self.latent_dim, self.num_key_value_heads * self.head_dim, bias=False)
+        # === Key-Value path with latent compression ===
+        self.W_dkv = nn.Linear(
+            self.hidden_size * 2,  # Fixed: match input dimension
+            self.latent_dim, 
+            bias=False
+        )
+        self.W_uk = nn.Linear(
+            self.latent_dim, 
+            self.num_key_value_heads * self.head_dim, 
+            bias=False
+        )
+        self.W_uv = nn.Linear(
+            self.latent_dim, 
+            self.num_key_value_heads * self.head_dim, 
+            bias=False
+        )
         self.kv_norm = nn.LayerNorm(self.latent_dim)
         
-        # === Decoupled RoPE (optional) ===
-        # RoPE doesn't play well with compression, so we use separate projections
-        self.rope_dim = getattr(config, 'mla_rope_dim', 64)
+        # === Decoupled RoPE projections (optional) ===
         if self.rope_dim > 0:
-            self.W_qr = nn.Linear(self.hidden_size, self.rope_dim, bias=False)
-            self.W_kr = nn.Linear(self.hidden_size, self.rope_dim, bias=False)
+            self.W_qr = nn.Linear(self.hidden_size * 2, self.rope_dim, bias=False)
+            self.W_kr = nn.Linear(self.hidden_size * 2, self.rope_dim, bias=False)
         
-        # Output projection
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        # === Output projection ===
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, 
+            self.hidden_size, 
+            bias=False
+        )
+        
+        # === RoPE embedding === 
+        self._init_rope()
+    
+    def _init_rope(self):
+        """Initialize rotary embeddings."""
+        rope_dim = self.rope_dim if self.rope_dim > 0 else self.head_dim
+        self.rotary_emb = EagleRotaryEmbedding(
+            rope_dim,
+            max_position_embeddings=self.max_position_embeddings,
+            base=getattr(self.config, "rope_theta", 10000),
+        )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        cache_hidden: Optional[List[torch.Tensor]] = None,
+        cache_hidden: Optional[List[List[torch.Tensor]]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,  # This now stores c_kv latent, not K/V
+        past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        
+    ) -> torch.Tensor:
+        """
+        Args:
+            hidden_states: [B, S, hidden_size * 2] - concatenated (input_emb, hidden_states)
+            cache_hidden: List of [keys_list, values_list] for tree speculation
+            attention_mask: [B, S] attention mask
+            position_ids: [B, S] position indices
+        """
         bsz, q_len, _ = hidden_states.size()
         
-        past_seen_tokens = (
-            past_key_values.get_seq_length() if past_key_values is not None else 0
-        )
-        
         # ============================================================
-        # MLA: Compute Q, and compress KV to latent
+        # Compute Q and compress KV to latent
         # ============================================================
         
-        # Query projection (direct, no compression)
         query_states = self.q_proj(hidden_states)
         query_states = query_states.view(
             bsz, q_len, self.num_heads, self.head_dim
         ).transpose(1, 2)  # [B, H, S, D]
         
-        # Key-Value compression to latent
+        # Compress to latent
         c_kv_new = self.kv_norm(self.W_dkv(hidden_states))  # [B, S, latent_dim]
         
         # ============================================================
-        # Handle decoupled RoPE (position info separate from content)
+        # Branch: with or without cache_hidden (tree speculation)
         # ============================================================
         
-        lck = past_seen_tokens // q_len
-        
-        if self.rope_dim > 0:
-            # Separate RoPE projections
-            q_rope = self.W_qr(hidden_states)  # [B, S, rope_dim]
-            k_rope_new = self.W_kr(hidden_states)  # [B, S, rope_dim]
+        if cache_hidden is None:
+            # === Standard attention (no tree speculation) ===
             
-            # Apply RoPE to these components
-            cos, sin = self.rotary_emb(q_rope, seq_len=q_len + past_seen_tokens)
+            # Apply RoPE
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
             
-            q_rope = apply_rotary_pos_emb_single(q_rope, cos, sin, position_ids + lck)
-            k_rope_new = apply_rotary_pos_emb_single(k_rope_new, cos, sin, position_ids + lck)
+            if self.rope_dim > 0:
+                # Decoupled RoPE
+                q_rope = self.W_qr(hidden_states)
+                k_rope = self.W_kr(hidden_states)
+                q_rope = apply_rotary_pos_emb_single(q_rope, cos, sin, position_ids)
+                k_rope = apply_rotary_pos_emb_single(k_rope, cos, sin, position_ids)
+                score_mod = self._create_rope_score_mod(q_rope, k_rope)
+            else:
+                # Standard RoPE on Q, will apply to K after decompression
+                query_states, _ = apply_rotary_pos_emb(
+                    query_states, query_states, cos, sin, position_ids
+                )
+                score_mod = None
+            
+            # Decompress to K, V
+            key_states = self.W_uk(c_kv_new)
+            value_states = self.W_uv(c_kv_new)
+            
+            key_states = key_states.view(
+                bsz, q_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            value_states = value_states.view(
+                bsz, q_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            
+            # Apply RoPE to K if not using decoupled RoPE
+            if self.rope_dim == 0:
+                _, key_states = apply_rotary_pos_emb(
+                    key_states, key_states, cos, sin, position_ids
+                )
+            
+            # GQA: repeat KV heads
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            
+            # Standard scaled dot product attention
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=attention_mask,
+                is_causal=attention_mask is None,
+                dropout_p=0.0,
+            )
+            
         else:
-            # Standard RoPE on full Q (applied after decompression for K)
-            cos, sin = self.rotary_emb(query_states, seq_len=q_len + past_seen_tokens)
+            # === Tree speculation with FlexAttention ===
+            
+            lck = len(cache_hidden[0])  # Number of cached speculation steps
+            
+            # Apply RoPE
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
             cos, sin = cos.to(query_states.device), sin.to(query_states.device)
-            query_states = apply_rotary_pos_emb_single(
-                query_states, cos, sin, position_ids + lck
+            
+            if self.rope_dim > 0:
+                q_rope = self.W_qr(hidden_states)
+                k_rope_new = self.W_kr(hidden_states)
+                q_rope = apply_rotary_pos_emb_single(q_rope, cos, sin, position_ids)
+                k_rope_new = apply_rotary_pos_emb_single(k_rope_new, cos, sin, position_ids)
+            else:
+                query_states, _ = apply_rotary_pos_emb(
+                    query_states, query_states, cos, sin, position_ids
+                )
+            
+            # Decompress current step
+            key_states = self.W_uk(c_kv_new)
+            value_states = self.W_uv(c_kv_new)
+            
+            key_states = key_states.view(
+                bsz, q_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            value_states = value_states.view(
+                bsz, q_len, self.num_key_value_heads, self.head_dim
+            ).transpose(1, 2)
+            
+            if self.rope_dim == 0:
+                _, key_states = apply_rotary_pos_emb(
+                    key_states, key_states, cos, sin, position_ids
+                )
+            
+            # GQA
+            key_states = repeat_kv(key_states, self.num_key_value_groups)
+            value_states = repeat_kv(value_states, self.num_key_value_groups)
+            
+            # Update cache_hidden with current K, V
+            # (For MLA, we could cache latents instead, but keeping compatible with EAGLE3)
+            cache_hidden[0] = cache_hidden[0] + [key_states]
+            cache_hidden[1] = cache_hidden[1] + [value_states]
+            
+            # Concatenate all cached K, V for FlexAttention
+            all_keys = torch.cat(cache_hidden[0], dim=2)      # [B, H, total_kv_len, D]
+            all_values = torch.cat(cache_hidden[1], dim=2)    # [B, H, total_kv_len, D]
+            
+            kv_len = all_keys.shape[2]
+            
+            # Compute sequence lengths for masking
+            seq_lengths = attention_mask.sum(dim=-1) if attention_mask is not None else torch.full(
+                (bsz,), q_len, device=hidden_states.device
             )
-            k_rope_new = None
-        
-        # ============================================================
-        # Update latent cache (NOT K/V cache!)
-        # ============================================================
-        
-        cache_position = torch.arange(
-            past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
-        )
-        
-        # Cache the compressed latent, not full K/V
-        # This is where MLA saves memory!
-        c_kv_cached, k_rope_cached = past_key_values.update_latent(
-            c_kv_new,
-            k_rope_new if self.rope_dim > 0 else None,
-            layer_idx=self.layer_idx,
-            cache_position=cache_position,
-        )
-        
-        # ============================================================
-        # Decompress latent → K, V (on-the-fly)
-        # ============================================================
-        
-        # Decompress full KV cache to get K and V
-        key_states = self.W_uk(c_kv_cached)    # [B, S_kv, H_kv * D]
-        value_states = self.W_uv(c_kv_cached)  # [B, S_kv, H_kv * D]
-        
-        key_states = key_states.view(
-            bsz, -1, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)  # [B, H_kv, S_kv, D]
-        
-        value_states = value_states.view(
-            bsz, -1, self.num_key_value_heads, self.head_dim
-        ).transpose(1, 2)  # [B, H_kv, S_kv, D]
-        
-        # Apply RoPE to K if not using decoupled RoPE
-        if self.rope_dim == 0:
-            # Need to apply RoPE to all cached positions
-            full_position_ids = torch.arange(
-                c_kv_cached.shape[1], device=hidden_states.device
-            ).unsqueeze(0).expand(bsz, -1)
-            key_states = apply_rotary_pos_emb_single(
-                key_states, cos, sin, full_position_ids
-            )
-        
-        # ============================================================
-        # FlexAttention with EAGLE3 mask
-        # ============================================================
-        
-        seq_lengths = attention_mask.sum(dim=-1)
-        seq_lengths -= lck  # Shrink for padding alignment
-        
-        kv_len = key_states.shape[2]
-        
-        # Choose compiled vs uncompiled based on sequence length
-        if q_len <= 128:
-            create_block_mask_func = create_block_mask
-            flex_attention_func = flex_attention
-        else:
-            create_block_mask_func = compile_friendly_create_block_mask
-            flex_attention_func = compile_friendly_flex_attention
-        
-        # Create the EAGLE3 mask for speculative decoding
-        block_mask = create_block_mask_func(
-            mask_mod=generate_eagle3_mask(
-                seq_lengths=seq_lengths,
+            seq_lengths = seq_lengths - lck
+            
+            # Choose compiled vs uncompiled
+            if q_len <= 128:
+                create_block_mask_func = create_block_mask
+                flex_attention_func = flex_attention
+            else:
+                create_block_mask_func = compile_block_mask
+                flex_attention_func = compile_mla_flex_attention
+            
+            # Create EAGLE3 mask
+            block_mask = create_block_mask_func(
+                mask_mod=generate_eagle3_mask(
+                    seq_lengths=seq_lengths,
+                    Q_LEN=q_len,
+                    KV_LEN=kv_len,
+                    lck=lck,
+                ),
+                B=bsz,
+                H=1,
                 Q_LEN=q_len,
                 KV_LEN=kv_len,
-                lck=lck,
-            ),
-            B=bsz,
-            H=1,  # Broadcast across heads
-            Q_LEN=q_len,
-            KV_LEN=kv_len,
-            device=query_states.device,
-        )
-        
-        # Run FlexAttention
-        # If using decoupled RoPE, we'd add rope scores via score_mod
-        if self.rope_dim > 0:
-            score_mod = self._create_rope_score_mod(q_rope, k_rope_cached)
-        else:
-            score_mod = None
-        
-        attn_output = flex_attention_func(
-            query=query_states,
-            key=key_states.contiguous(),
-            value=value_states.contiguous(),
-            block_mask=block_mask,
-            score_mod=score_mod,
-            enable_gqa=True,
-        )
+                device=query_states.device,
+            )
+            
+            # Score mod for decoupled RoPE
+            if self.rope_dim > 0:
+                all_k_rope = torch.cat(
+                    [k_rope_new] * (lck + 1),  # Simplified; real impl needs cached rope
+                    dim=1
+                )
+                score_mod = self._create_rope_score_mod(q_rope, all_k_rope)
+            else:
+                score_mod = None
+            
+            # FlexAttention
+            attn_output = flex_attention_func(
+                query=query_states,
+                key=all_keys.contiguous(),
+                value=all_values.contiguous(),
+                block_mask=block_mask,
+                score_mod=score_mod,
+                enable_gqa=False,  # Already expanded via repeat_kv
+            )
         
         # ============================================================
         # Output projection
@@ -639,19 +734,12 @@ class EagleFlexMLA(nn.Module):
         return attn_output
 
     def _create_rope_score_mod(self, q_rope: torch.Tensor, k_rope: torch.Tensor):
-        """
-        Create a score_mod that adds RoPE-based attention scores.
-        
-        For decoupled RoPE: position info is in separate q_rope, k_rope tensors.
-        We add their dot product to the content-based attention scores.
-        """
-        # Reshape for attention: [B, S, rope_dim] → [B, 1, S, rope_dim]
-        q_rope = q_rope.unsqueeze(1)
-        k_rope = k_rope.unsqueeze(1)
+        """Create score_mod for decoupled RoPE."""
+        q_rope = q_rope.unsqueeze(1)  # [B, 1, S_q, rope_dim]
+        k_rope = k_rope.unsqueeze(1)  # [B, 1, S_kv, rope_dim]
         rope_scale = self.rope_dim ** -0.5
         
         def rope_score_mod(score, b, h, q_idx, kv_idx):
-            # Add position-based score component
             rope_score = (q_rope[b, 0, q_idx] * k_rope[b, 0, kv_idx]).sum() * rope_scale
             return score + rope_score
         
