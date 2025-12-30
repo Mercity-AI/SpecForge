@@ -15,6 +15,13 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
+from specforge.modelling.draft.mla_flex_attention import (
+    compile_mla_flex_attention,
+    compile_block_mask,
+    generate_eagle3_mask
+)
+
+
 from specforge.utils import print_with_rank
 
 from .base import Eagle3DraftModel
@@ -838,6 +845,315 @@ class LlamaFlexAttention(LlamaAttention):
         attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
         attn_output = self.o_proj(attn_output)
         return attn_output
+
+class LlamaFlexMLA(LlamaAttention):
+    """
+    Multi-Head Latent Attention with FlexAttention.
+    
+    Key difference from standard attention:
+    - Instead of caching K, V directly, we cache the compressed latent c_kv
+    - K, V are decompressed on-the-fly during attention
+    - Significantly reduced KV cache size: (H * head_dim * 2) → latent_dim
+    """
+
+    def __init__(self, config, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        
+        # MLA latent dimensions (configurable, defaults to 1/4 of KV size)
+        self.latent_dim = getattr(
+            config, 
+            'mla_latent_dim', 
+            self.num_key_value_heads * self.head_dim // 4
+        )
+        self.q_latent_dim = getattr(
+            config,
+            'mla_q_latent_dim',
+            self.latent_dim
+        )
+        
+        # === Query path ===
+        # Option A: Direct projection (no compression for Q)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        
+        # Option B: Compressed Q (uncomment to use)
+        # self.W_dq = nn.Linear(self.hidden_size, self.q_latent_dim, bias=False)
+        # self.W_uq = nn.Linear(self.q_latent_dim, self.num_heads * self.head_dim, bias=False)
+        # self.q_norm = nn.LayerNorm(self.q_latent_dim)
+        
+        # === Key-Value path (MLA's core innovation) ===
+        # Down-project to shared latent
+        self.W_dkv = nn.Linear(self.hidden_size, self.latent_dim, bias=False)
+        # Up-project to K and V separately
+        self.W_uk = nn.Linear(self.latent_dim, self.num_key_value_heads * self.head_dim, bias=False)
+        self.W_uv = nn.Linear(self.latent_dim, self.num_key_value_heads * self.head_dim, bias=False)
+        self.kv_norm = nn.LayerNorm(self.latent_dim)
+        
+        # === Decoupled RoPE (optional) ===
+        # RoPE doesn't play well with compression, so we use separate projections
+        self.rope_dim = getattr(config, 'mla_rope_dim', 64)
+        if self.rope_dim > 0:
+            self.W_qr = nn.Linear(self.hidden_size, self.rope_dim, bias=False)
+            self.W_kr = nn.Linear(self.hidden_size, self.rope_dim, bias=False)
+        
+        # Output projection
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,  # This now stores c_kv latent, not K/V
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        
+        bsz, q_len, _ = hidden_states.size()
+        
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        
+        # ============================================================
+        # MLA: Compute Q, and compress KV to latent
+        # ============================================================
+        
+        # Query projection (direct, no compression)
+        query_states = self.q_proj(hidden_states)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)  # [B, H, S, D]
+        
+        # Key-Value compression to latent
+        c_kv_new = self.kv_norm(self.W_dkv(hidden_states))  # [B, S, latent_dim]
+        
+        # ============================================================
+        # Handle decoupled RoPE (position info separate from content)
+        # ============================================================
+        
+        lck = past_seen_tokens // q_len
+        
+        if self.rope_dim > 0:
+            # Separate RoPE projections
+            q_rope = self.W_qr(hidden_states)  # [B, S, rope_dim]
+            k_rope_new = self.W_kr(hidden_states)  # [B, S, rope_dim]
+            
+            # Apply RoPE to these components
+            cos, sin = self.rotary_emb(q_rope, seq_len=q_len + past_seen_tokens)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            
+            q_rope = apply_rotary_pos_emb_single(q_rope, cos, sin, position_ids + lck)
+            k_rope_new = apply_rotary_pos_emb_single(k_rope_new, cos, sin, position_ids + lck)
+        else:
+            # Standard RoPE on full Q (applied after decompression for K)
+            cos, sin = self.rotary_emb(query_states, seq_len=q_len + past_seen_tokens)
+            cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+            query_states = apply_rotary_pos_emb_single(
+                query_states, cos, sin, position_ids + lck
+            )
+            k_rope_new = None
+        
+        # ============================================================
+        # Update latent cache (NOT K/V cache!)
+        # ============================================================
+        
+        cache_position = torch.arange(
+            past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
+        )
+        
+        # Cache the compressed latent, not full K/V
+        # This is where MLA saves memory!
+        c_kv_cached, k_rope_cached = past_key_values.update_latent(
+            c_kv_new,
+            k_rope_new if self.rope_dim > 0 else None,
+            layer_idx=self.layer_idx,
+            cache_position=cache_position,
+        )
+        
+        # ============================================================
+        # Decompress latent → K, V (on-the-fly)
+        # ============================================================
+        
+        # Decompress full KV cache to get K and V
+        key_states = self.W_uk(c_kv_cached)    # [B, S_kv, H_kv * D]
+        value_states = self.W_uv(c_kv_cached)  # [B, S_kv, H_kv * D]
+        
+        key_states = key_states.view(
+            bsz, -1, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)  # [B, H_kv, S_kv, D]
+        
+        value_states = value_states.view(
+            bsz, -1, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)  # [B, H_kv, S_kv, D]
+        
+        # Apply RoPE to K if not using decoupled RoPE
+        if self.rope_dim == 0:
+            # Need to apply RoPE to all cached positions
+            full_position_ids = torch.arange(
+                c_kv_cached.shape[1], device=hidden_states.device
+            ).unsqueeze(0).expand(bsz, -1)
+            key_states = apply_rotary_pos_emb_single(
+                key_states, cos, sin, full_position_ids
+            )
+        
+        # ============================================================
+        # FlexAttention with EAGLE3 mask
+        # ============================================================
+        
+        seq_lengths = attention_mask.sum(dim=-1)
+        seq_lengths -= lck  # Shrink for padding alignment
+        
+        kv_len = key_states.shape[2]
+        
+        # Choose compiled vs uncompiled based on sequence length
+        if q_len <= 128:
+            create_block_mask_func = create_block_mask
+            flex_attention_func = flex_attention
+        else:
+            create_block_mask_func = compile_friendly_create_block_mask
+            flex_attention_func = compile_friendly_flex_attention
+        
+        # Create the EAGLE3 mask for speculative decoding
+        block_mask = create_block_mask_func(
+            mask_mod=generate_eagle3_mask(
+                seq_lengths=seq_lengths,
+                Q_LEN=q_len,
+                KV_LEN=kv_len,
+                lck=lck,
+            ),
+            B=bsz,
+            H=1,  # Broadcast across heads
+            Q_LEN=q_len,
+            KV_LEN=kv_len,
+            device=query_states.device,
+        )
+        
+        # Run FlexAttention
+        # If using decoupled RoPE, we'd add rope scores via score_mod
+        if self.rope_dim > 0:
+            score_mod = self._create_rope_score_mod(q_rope, k_rope_cached)
+        else:
+            score_mod = None
+        
+        attn_output = flex_attention_func(
+            query=query_states,
+            key=key_states.contiguous(),
+            value=value_states.contiguous(),
+            block_mask=block_mask,
+            score_mod=score_mod,
+            enable_gqa=True,
+        )
+        
+        # ============================================================
+        # Output projection
+        # ============================================================
+        
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
+        attn_output = self.o_proj(attn_output)
+        
+        return attn_output
+
+    def _create_rope_score_mod(self, q_rope: torch.Tensor, k_rope: torch.Tensor):
+        """
+        Create a score_mod that adds RoPE-based attention scores.
+        
+        For decoupled RoPE: position info is in separate q_rope, k_rope tensors.
+        We add their dot product to the content-based attention scores.
+        """
+        # Reshape for attention: [B, S, rope_dim] → [B, 1, S, rope_dim]
+        q_rope = q_rope.unsqueeze(1)
+        k_rope = k_rope.unsqueeze(1)
+        rope_scale = self.rope_dim ** -0.5
+        
+        def rope_score_mod(score, b, h, q_idx, kv_idx):
+            # Add position-based score component
+            rope_score = (q_rope[b, 0, q_idx] * k_rope[b, 0, kv_idx]).sum() * rope_scale
+            return score + rope_score
+        
+        return rope_score_mod
+
+
+# ============================================================
+# Helper: Single tensor RoPE application
+# ============================================================
+
+def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
+    """Apply RoPE to a single tensor (Q or K separately)."""
+    cos = cos[position_ids].unsqueeze(1)  # [B, 1, S, D]
+    sin = sin[position_ids].unsqueeze(1)
+    
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    
+    rotated = torch.stack([
+        x1 * cos[..., ::2] - x2 * sin[..., ::2],
+        x1 * sin[..., 1::2] + x2 * cos[..., 1::2]
+    ], dim=-1).flatten(-2)
+    
+    return rotated
+
+
+# ============================================================
+# Custom cache for MLA (stores latent, not K/V)
+# ============================================================
+
+class MLACache(Cache):
+    """
+    Cache for MLA that stores compressed latents instead of full K/V.
+    
+    Memory comparison for 32 layers, 32 heads, head_dim=128, seq_len=4096:
+        Standard: 32 * 32 * 128 * 2 * 4096 * 2 bytes = 2.1 GB
+        MLA (latent_dim=512): 32 * 512 * 4096 * 2 bytes = 134 MB
+        
+    ~16x memory reduction!
+    """
+    
+    def __init__(self, num_layers: int, latent_dim: int, rope_dim: int = 0):
+        super().__init__()
+        self.num_layers = num_layers
+        self.latent_dim = latent_dim
+        self.rope_dim = rope_dim
+        
+        # Per-layer latent caches
+        self.c_kv_cache: List[Optional[torch.Tensor]] = [None] * num_layers
+        self.k_rope_cache: List[Optional[torch.Tensor]] = [None] * num_layers
+    
+    def get_seq_length(self, layer_idx: int = 0) -> int:
+        if self.c_kv_cache[layer_idx] is None:
+            return 0
+        return self.c_kv_cache[layer_idx].shape[1]
+    
+    def update_latent(
+        self,
+        c_kv_new: torch.Tensor,
+        k_rope_new: Optional[torch.Tensor],
+        layer_idx: int,
+        cache_position: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Update the latent cache with new tokens."""
+        
+        if self.c_kv_cache[layer_idx] is None:
+            self.c_kv_cache[layer_idx] = c_kv_new
+            if k_rope_new is not None:
+                self.k_rope_cache[layer_idx] = k_rope_new
+        else:
+            self.c_kv_cache[layer_idx] = torch.cat(
+                [self.c_kv_cache[layer_idx], c_kv_new], dim=1
+            )
+            if k_rope_new is not None:
+                self.k_rope_cache[layer_idx] = torch.cat(
+                    [self.k_rope_cache[layer_idx], k_rope_new], dim=1
+                )
+        
+        return self.c_kv_cache[layer_idx], self.k_rope_cache[layer_idx]
+
 
 
 class LlamaMLP(nn.Module):
