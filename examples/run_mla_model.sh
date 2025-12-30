@@ -1,0 +1,29 @@
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+ROOT_DIR=$(dirname $SCRIPT_DIR)
+export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
+
+# train eagle3 for llama3.1-8b
+NUM_GPUS=${1:-1}
+TP_SIZE=${2:-1}
+BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
+
+torchrun \
+    --standalone \
+    --nproc_per_node $NUM_GPUS \
+    $ROOT_DIR/scripts/train_eagle3.py \
+    --target-model-path Qwen/Qwen-3-8B \
+    --draft-model-config $ROOT_DIR/configs/eagle3-config.json \
+    --train-data-path $ROOT_DIR/cache/dataset/train.jsonl \
+    --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
+    --output-dir $ROOT_DIR/outputs/eagle3-sharegpt \
+    --num-epochs 2 \
+    --batch-size 4 \
+    --tp-size $TP_SIZE \
+    --learning-rate 1e-4 \
+    --max-length 2048 \
+    --chat-template llama3 \
+    --cache-dir $ROOT_DIR/cache \
+    --attention-backend mla_flex_attention \
+    --target-model-backend sglang \
+    --log-interval 10 \
+    --sglang-mem-fraction-static 0.25
