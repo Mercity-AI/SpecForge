@@ -1342,7 +1342,7 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         """
         Arguments:
             hidden_states (`torch.FloatTensor`): input to the layer, cat low, mid high hidden_states of shape `(batch, seq_len, hidden_states * 3)`
-            input_ids (`torch.LongTensor`): input ids of shape `(batch, seq_len)`
+            input_ids (`torch.LongTensor`): inp ut ids of shape `(batch, seq_len)`
             attention_mask (`torch.FloatTensor`): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`

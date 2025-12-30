@@ -736,11 +736,7 @@ class EagleDecoderLayer(nn.Module):
         # outputs = (hidden_states, return_hidden)
         return hidden_states
 
-
-
-
-    
-class LlamaForCausalLMEagle3(Eagle3DraftModel):
+class EagleForCausalLM(Eagle3DraftModel):
 
     config_class = LlamaConfig
 
