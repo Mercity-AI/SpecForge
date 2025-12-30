@@ -15,7 +15,7 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.modeling.draft.mla_flex_attention import (
+from specforge.modeling.draft.mla_flex_attn import (
     compile_mla_flex_attention,
     compile_block_mask,
 )
