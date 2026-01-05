@@ -3,7 +3,7 @@ import os
 from typing import Optional, Union
 
 import torch
-from SpecForge.specforge.utils import print_on_rank0
+from specforge.utils import print_with_rank
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
