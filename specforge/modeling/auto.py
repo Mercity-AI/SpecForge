@@ -135,7 +135,7 @@ class AutoDraftModelConfig:
 
     _config_mapping = {
         "LlamaForCausalLMEagle3": LlamaConfig,
-        "EagleForCausalLM": LlamaConfig
+        # "EagleForCausalLM": LlamaConfig
     }
 
     @classmethod

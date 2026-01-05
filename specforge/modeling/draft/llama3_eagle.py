@@ -15,11 +15,7 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.modelling.draft.mla_flex_attention import (
-    compile_mla_flex_attention,
-    compile_block_mask,
-    generate_eagle3_mask
-)
+
 
 
 from specforge.utils import print_with_rank
