@@ -1,6 +1,7 @@
 # from .auto import AutoDistributedTargetModel, AutoDraftModelConfig, AutoEagle3DraftModel
 from .auto import AutoDraftModelConfig, AutoEagle3DraftModel
 from .draft.llama3_eagle import LlamaForCausalLMEagle3
+from .draft.eagle3 import Eagle3DraftModel
 from .target.eagle3_target_model import (
     CustomEagle3TargetModel,
     HFEagle3TargetModel,
@@ -15,5 +16,6 @@ __all__ = [
     "CustomEagle3TargetModel",
     "get_eagle3_target_model",
     "AutoDraftModelConfig",
+    "Eagle3DraftModel",
     "AutoEagle3DraftModel",
 ]
