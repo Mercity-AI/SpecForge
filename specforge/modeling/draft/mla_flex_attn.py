@@ -8,7 +8,7 @@ from torch.nn.attention.flex_attention import (
     or_masks,
 )
 import torch._dynamo as dynamo
-from transformer.utils import is_torchdynamo_compiling
+from transformers.utils import is_torchdynamo_compiling
 
 dynamo.config.recompile_limit = 64
 
