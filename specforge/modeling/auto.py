@@ -3,6 +3,7 @@ import os
 from typing import Optional, Union
 
 import torch
+from SpecForge.specforge.utils import print_on_rank0
 from transformers import AutoConfig
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
@@ -50,6 +51,7 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
         Returns:
             A model instance.
         """
+        print_on_rank0("Loading config: ", cls._model_mapping[type(config)])
         # get the model class from the
         _model_cls = cls._model_mapping[type(config)]
         model = _model_cls(config, **config_kwargs)
