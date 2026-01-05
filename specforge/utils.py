@@ -50,15 +50,21 @@ def load_config_from_file(config_path: str):
 
 
 def print_with_rank(message):
+    """Print message with rank information. Uses print() to ensure output is visible."""
     if dist.is_available() and dist.is_initialized():
-        logger.info(f"rank {dist.get_rank()}: {message}")
+        print(f"rank {dist.get_rank()}: {message}")
     else:
-        logger.info(f"non-distributed: {message}")
+        print(f"non-distributed: {message}")
 
 
-def print_on_rank0(message):
-    if dist.get_rank() == 0:
-        logger.info(message)
+def print_on_rank0(message, *args, **kwargs):
+    """Print message only on rank 0. Uses print() to ensure output is visible."""
+    if dist.is_available() and dist.is_initialized():
+        if dist.get_rank() == 0:
+            print(message, *args, **kwargs)
+    else:
+        # If distributed is not initialized, print anyway (single process case)
+        print(message, *args, **kwargs)
 
 
 def get_last_checkpoint(folder, prefix="epoch"):
