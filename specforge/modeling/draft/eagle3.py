@@ -445,6 +445,109 @@ class EagleAttention(nn.Module):
 
         return attn_output
 
+
+class EagleFlexAttention(EagleAttention):
+    """
+    Attention layer implemented with flex attention. We keep the parameters consistent with EagleAttention.
+    The used parameters are:
+        - hidden_states: input hidden states
+        - attention_mask: attention mask not expanded, straight from data loader.
+        - position_ids: position ids
+        - past_key_values: dynamic cache used for storing past key and value states.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_hidden: Optional[List[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+
+        lck = past_seen_tokens // q_len
+        cos, sin = self.rotary_emb(query_states, seq_len=q_len + lck)
+        cos, sin = cos.to(query_states.device), sin.to(query_states.device)
+        # Keep positions ids aligned when padding so the KV cache is unaffected.
+        query_states, key_states = apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids + lck
+        )
+
+        cache_position: torch.Tensor = torch.arange(
+            past_seen_tokens, past_seen_tokens + q_len, device=hidden_states.device
+        )
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+
+        key_cache, value_cache = past_key_values.update(
+            key_states,
+            value_states,
+            layer_idx=0,  # TODO: support multiple layers
+            cache_kwargs=cache_kwargs,
+        )
+
+        seq_lengths = attention_mask.sum(dim=-1)
+        # Shrink the attention mask to align with the padding to the right.
+        # This is equivalent to the shrinking logic in eagle3.py
+        seq_lengths -= lck
+        # TODO: Remove the usage of uncompiled create_block_mask after
+        # https://github.com/pytorch/pytorch/issues/160018
+        if q_len <= 128:
+            create_block_mask_func = create_block_mask
+            flex_attention_func = flex_attention
+        else:
+            create_block_mask_func = compile_friendly_create_block_mask
+            flex_attention_func = compile_friendly_flex_attention
+
+        block_mask = create_block_mask_func(
+            mask_mod=generate_eagle3_mask(
+                seq_lengths=seq_lengths,
+                Q_LEN=q_len,
+                KV_LEN=key_cache.shape[-2],
+                lck=lck,
+            ),
+            B=bsz,
+            H=1,  # Rely on broadcast
+            Q_LEN=q_len,
+            KV_LEN=key_cache.shape[-2],
+            device=query_states.device,
+        )
+        
+        # GQA: flex_attention handles repetition internally when enable_gqa=True
+        # key_cache and value_cache are [B, H_kv, S, D], query_states is [B, H, S, D]
+        attn_output = flex_attention_func(
+            query=query_states,
+            key=key_cache.contiguous(),
+            value=value_cache.contiguous(),
+            block_mask=block_mask,
+            enable_gqa=True,  # flex_attention will handle GQA repetition
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.head_dim * self.num_heads)
+        attn_output = self.o_proj(attn_output)
+        return attn_output
+
+
 class EagleFlexMLA(nn.Module):
     """
     Multi-Head Latent Attention with FlexAttention for EAGLE3.
@@ -750,10 +853,13 @@ class EagleDecoderLayer(nn.Module):
 
         if attention_backend == "sdpa":
             self.self_attn = EagleAttention(config=config)
+        elif attention_backend == "flex_attention":
+            print_with_rank("Using flex attention on draft model training!")
+            self.self_attn = EagleFlexAttention(config=config)
         elif attention_backend == 'flex':
             pass
         elif attention_backend == "flex_attention_mla":
-            print_with_rank("Using flex attention on draft model training!")
+            print_with_rank("Using flex attention MLA on draft model training!")
             self.self_attn = EagleFlexMLA(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
