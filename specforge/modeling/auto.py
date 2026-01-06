@@ -157,7 +157,7 @@ class AutoDistributedTargetModel(AutoModelForCausalLMBase):
 class AutoDraftModelConfig:
 
     _config_mapping = {
-        # "LlamaForCausalLMEagle3": LlamaConfig,
+        "LlamaForCausalLMEagle3": LlamaConfig,
         "EagleForCausalLM": LlamaConfig
     }
 

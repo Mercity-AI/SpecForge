@@ -858,6 +858,40 @@ class EagleForCausalLM(Eagle3DraftModel):
         self.register_buffer("t2d", t2d)
         self.register_buffer("d2t", d2t)
 
+    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
+    def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # eagle 3 requires hidden states from 3 layers
+        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        return self.fc(hidden_states)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        norm_hidden_states = self.norm(hidden_states)
+        return self.lm_head(norm_hidden_states)
+
+    def backbone(
+        self,
+        input_embeds: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_hidden: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values: Optional[Cache] = None,
+        use_cache: bool = True,
+    ) -> torch.Tensor:
+        return self.midlayer(
+            input_emb=input_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            output_attentions=False,
+            use_cache=False,
+        )
+
+
     def forward(
         self,
         hidden_states: torch.Tensor,
