@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import math
+import wandb
 import os
 import time
 from argparse import ArgumentParser, Namespace
@@ -48,7 +49,6 @@ from specforge.utils import (
     create_draft_config_from_target,
     get_last_checkpoint,
     print_on_rank0,
-    print_with_rank,
     rank_0_priority,
 )
 
@@ -461,6 +461,8 @@ def build_dataloaders(
         )
     else:
         eval_dataloader = None
+
+
     return (
         train_dataloader,
         vocab_mapping_path,
@@ -626,6 +628,14 @@ def main():
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
     sanity_check(args)
+
+    # In main(), after parse_args and init_distributed, add:
+    if dist.get_rank() == 0:
+        wandb.init(
+            project="eagle3-training",  # change this
+            name=f"{os.path.basename(args.target_model_path)}_{args.seed}",
+            config=vars(args),
+        )
     
     print_on_rank0(f"Training: {args.target_model_path} -> {args.output_dir}")
     print_on_rank0(f"Mode: {'online' if is_online else 'offline'}, World size: {dist.get_world_size()}, TP: {args.tp_size}, DP: {args.dp_size}")
@@ -770,6 +780,18 @@ def main():
                     f"t={time_per_step:.1f}s gpu={get_gpu_memory_gb():.1f}GB"
                 )
 
+                # Add this:
+                if dist.get_rank() == 0:
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/acc": avg_acc,
+                        "train/lr": optimizer.get_learning_rate(),
+                        "train/step_time": time_per_step,
+                        "train/gpu_memory_gb": get_gpu_memory_gb(),
+                        **{f"train/loss_{i}": plosses[i].item() for i in range(len(plosses))},
+                        **{f"train/acc_{i}": acces[i].item() for i in range(len(acces))},
+                    }, step=global_step)
+
             if dist.get_rank() == 0:
                 progress_bar.set_postfix({"loss": f"{avg_loss:.3f}", "acc": f"{avg_acc:.1%}"})
 
@@ -818,6 +840,9 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
+
+    if dist.get_rank() == 0:
+        wandb.finish()
 
     # Cleanup
     print_on_rank0(f"\nTraining completed: {global_step} steps")
