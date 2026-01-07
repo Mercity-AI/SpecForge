@@ -854,12 +854,10 @@ class EagleDecoderLayer(nn.Module):
         if attention_backend == "sdpa":
             self.self_attn = EagleAttention(config=config)
         elif attention_backend == "flex_attention":
-            print_with_rank("Using flex attention on draft model training!")
             self.self_attn = EagleFlexAttention(config=config)
         elif attention_backend == 'flex':
             pass
         elif attention_backend == "flex_attention_mla":
-            print_with_rank("Using flex attention MLA on draft model training!")
             self.self_attn = EagleFlexMLA(config=config)
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
@@ -1014,10 +1012,8 @@ class EagleForCausalLM(Eagle3DraftModel):
             position_ids (`torch.LongTensor`, *optional*): position ids of shape `(batch, seq_len)`
         """
         if ttt_length == 1:
-            print_with_rank("using ttt_length 1, no need to cache hidden states")
             cache_hidden = None
         else:
-            print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
             cache_hidden = [[], []]
 
         batch_size, seq_length, _ = hidden_states.size()

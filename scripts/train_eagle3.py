@@ -52,7 +52,7 @@ from specforge.utils import (
     rank_0_priority,
 )
 
-print_on_rank0("started training for eagle3")
+# Training script started
 
 def count_parameters(model: nn.Module) -> Tuple[int, int]:
     total = sum(p.numel() for p in model.parameters())
@@ -253,7 +253,6 @@ def build_target_model(
     Returns:
         The target model.
     """
-    print_on_rank0(f"Building target model (online={is_online}, backend={args.target_model_backend})")
     if is_online:
         if (
             args.is_vlm
@@ -297,26 +296,21 @@ def build_target_model(
             target_model.set_aux_hidden_states_layers()
 
         if args.is_vlm:
-            print_on_rank0("Loading VLM processor...")
             processor = AutoProcessor.from_pretrained(
                 args.target_model_path,
                 min_pixels=args.min_pixels,
                 max_pixels=args.max_pixels,
             )
-            print_on_rank0("VLM processor loaded successfully")
         else:
             processor = None
 
-        print_on_rank0("Target model built successfully")
         return target_model, processor
     else:
-        print_on_rank0("Building target head for offline training...")
         target_head = TargetHead.from_pretrained(
             model_path=args.target_model_path,
             lm_head_key=args.lm_head_key,
             cache_dir=args.model_download_dir,
         )
-        print_on_rank0("Target head built successfully")
         return target_head, None
 
 
@@ -336,20 +330,13 @@ def sanity_check(args: Namespace) -> None:
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
     # Handle draft model config
-    print_on_rank0("Building the draft model...")
     if args.draft_model_config is None:
-        # Auto-generate and save config file
-        print_on_rank0("No draft model config provided, auto-generating from target model...")
         auto_config_path = create_draft_config_from_target(
             target_model_path=args.target_model_path, cache_dir=args.model_download_dir
         )
-        print_on_rank0(f"Auto-generated config saved to: {auto_config_path}")
         draft_model_config = AutoDraftModelConfig.from_file(auto_config_path)
     else:
-        # Use provided config file
-        print_on_rank0(f"Loading draft model config from: {args.draft_model_config}")
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
-        print_on_rank0("Draft model config loaded successfully")
 
     # Handle base ckpt, config file
     draft_model_last_checkpoint = None
@@ -365,34 +352,28 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
 
     # detecting last ckpt for draft model
     if args.resume and os.path.isdir(args.output_dir):
-        print_on_rank0(args.output_dir)
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
-        print_on_rank0(f"Last checkpoint detected: {draft_model_last_checkpoint}")
+        if draft_model_last_checkpoint:
+            print_on_rank0(f"Resuming from checkpoint: {draft_model_last_checkpoint}")
 
     if draft_model_last_checkpoint:
-        print_on_rank0(f"Loading draft model from checkpoint: {draft_model_last_checkpoint}")
         draft_model = AutoEagle3DraftModel.from_pretrained(
             draft_model_last_checkpoint,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
-        print_on_rank0("Draft model loaded from checkpoint successfully")
     else:
-        print_on_rank0("Creating new draft model from config...")
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
-        print_on_rank0("Draft model created from config successfully")
 
-    print_on_rank0(f"Loading embeddings from target model: {args.target_model_path}")
     draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
     draft_model.freeze_embedding()
-    print_on_rank0("Embeddings loaded and frozen")
 
     total_params, trainable_params = count_parameters(draft_model)
-    print_on_rank0(f"\nDRAFT MODEL: {total_params/1e6:.1f}M params ({trainable_params/1e6:.1f}M trainable), GPU: {get_gpu_memory_gb():.1f}GB")
+    print_on_rank0(f"Draft model: {total_params/1e6:.1f}M params ({trainable_params/1e6:.1f}M trainable), GPU: {get_gpu_memory_gb():.1f}GB")
 
     return draft_model_config, draft_model
 
@@ -404,9 +385,7 @@ def build_dataloaders(
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
     
     # build dataloaders
-    print_on_rank0(f"Loading tokenizer from: {args.target_model_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    print_on_rank0("Tokenizer loaded successfully")
 
     # convert to dataloader
     cache_params_string = (
@@ -416,10 +395,8 @@ def build_dataloaders(
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    print_on_rank0(f"Loading training dataset from: {args.train_data_path}")
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
-    print_on_rank0(f"Raw training dataset loaded: {len(train_dataset)} samples")
-    print_on_rank0("Building Eagle3 training dataset...")
+    
     with rank_0_priority():
         train_eagle3_dataset = build_eagle3_dataset(
             dataset=train_dataset,
@@ -433,8 +410,6 @@ def build_dataloaders(
             processor=processor,
             num_proc=args.build_dataset_num_proc,
         )
-        print_on_rank0("Training dataset built successfully")
-        print_on_rank0("Generating vocab mapping file...")
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
             target_vocab_size=draft_model_config.vocab_size,
@@ -442,17 +417,13 @@ def build_dataloaders(
             cache_dir=os.path.join(args.cache_dir, "vocab_mapping"),
             cache_key=cache_key,
         )
-        print_on_rank0(f"Vocab mapping file generated: {vocab_mapping_path}")
 
         if args.train_hidden_states_path is not None:
-            print_on_rank0(f"Loading offline hidden states from: {args.train_hidden_states_path}")
             train_eagle3_dataset = build_offline_eagle3_dataset(
                 args.train_hidden_states_path,
                 args.max_length,
             )
-            print_on_rank0("Offline hidden states dataset loaded")
 
-    print_on_rank0("Preparing training dataloader...")
     train_dataloader = prepare_dp_dataloaders(
         train_eagle3_dataset,
         args.target_batch_size,
@@ -461,10 +432,8 @@ def build_dataloaders(
         process_group=get_dp_group(),
         is_vlm=args.is_vlm,
     )
-    print_on_rank0(f"Training dataloader prepared: batch_size={args.target_batch_size}")
 
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
-        print_on_rank0("Building evaluation dataset...")
         if args.eval_data_path is not None:
             eval_dataset = load_dataset("json", data_files=args.eval_data_path)["train"]
             eval_eagle3_dataset = build_eagle3_dataset(
@@ -482,7 +451,6 @@ def build_dataloaders(
                 args.eval_hidden_states_path,
                 args.max_length,
             )
-        print_on_rank0("Preparing evaluation dataloader...")
         eval_dataloader = prepare_dp_dataloaders(
             eval_eagle3_dataset,
             args.target_batch_size,
@@ -491,11 +459,8 @@ def build_dataloaders(
             process_group=get_dp_group(),
             is_vlm=args.is_vlm,
         )
-        print_on_rank0(f"Evaluation dataloader prepared: {len(eval_dataloader)} batches")
-        print_with_rank("Initialized eval dataloader")
     else:
         eval_dataloader = None
-        print_on_rank0("No evaluation dataset provided, skipping eval dataloader")
     return (
         train_dataloader,
         vocab_mapping_path,
@@ -534,14 +499,10 @@ def save_checkpoints(
                 state_to_save,
                 os.path.join(epoch_output_dir, "training_state.pt"),
             )
-            print_on_rank0(
-                f"Saved full training state to {epoch_output_dir}/training_state.pt"
-            )
             eagle3_model.draft_model.save_pretrained(
                 epoch_output_dir,
                 state_dict=draft_model_state_dict,
             )
-            print_on_rank0(f"Saved model configuration to {epoch_output_dir}")
         dist.barrier()
 
 
@@ -658,63 +619,30 @@ def main():
     # ================================================
     # 1. Initialize
     # ================================================
-    print_on_rank0("=" * 80)
-    print_on_rank0("Starting Eagle3 Training Script")
-    print_on_rank0("=" * 80)
-    
     parser, args = parse_args()
-    print_on_rank0(f"Parsed arguments: output_dir={args.output_dir}, target_model={args.target_model_path}")
-    print_on_rank0(f"Training mode: {'online' if args.train_data_path and not args.train_hidden_states_path else 'offline'}")
-    
     set_seed(args.seed)
-    print_on_rank0(f"Set random seed to {args.seed}")
-    
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
-
     sanity_check(args)
-    print_on_rank0(f"Distributed setup: world_size={dist.get_world_size()}, tp_size={args.tp_size}, dp_size={args.dp_size}")
-    print_with_rank("Initialized distributed environment")
+    
+    print_on_rank0(f"Training: {args.target_model_path} -> {args.output_dir}")
+    print_on_rank0(f"Mode: {'online' if is_online else 'offline'}, World size: {dist.get_world_size()}, TP: {args.tp_size}, DP: {args.dp_size}")
 
-    # ================================================
-    # 2. Build models
-    # ================================================
-    print_on_rank0("\n" + "=" * 80)
-    print_on_rank0("Building Models")
-    print_on_rank0("=" * 80)
+    # Build models
     draft_model_config, draft_model = build_draft_model(args)
-    print_on_rank0("Building target model...")
     target_model, processor = build_target_model(args, draft_model_config, is_online)
-    print_on_rank0("Target model built successfully")
 
-    # ================================================
-    # 3. Build dataloader
-    # ================================================
-    print_on_rank0("\n" + "=" * 80)
-    print_on_rank0("Building DataLoaders")
-    print_on_rank0("=" * 80)
-    print_on_rank0(f"Loading training data from: {args.train_data_path}")
+    # Build dataloaders
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
         args, draft_model_config, processor
     )
-    print_on_rank0(f"Training dataloader built: {len(train_dataloader)} batches")
-    if eval_dataloader is not None:
-        print_on_rank0(f"Evaluation dataloader built: {len(eval_dataloader)} batches")
-    else:
-        print_on_rank0("No evaluation dataloader (eval_data_path not provided)")
-
-    # ADD AFTER:
-    print_on_rank0(f"TRAINING: {len(train_dataloader.dataset):,} samples, {len(train_dataloader)} steps/epoch, {args.total_steps} total steps")
-    print_on_rank0(f"CONFIG: lr={args.learning_rate}, batch={args.target_batch_size}x{args.draft_accumulation_steps}, world={dist.get_world_size()} (TP={args.tp_size})")
-
-
-    # we load the vocab mapping then
-    print_on_rank0(f"Loading vocab mapping from: {vocab_mapping_path}")
     draft_model.load_vocab_mapping(vocab_mapping_path)
-    print_on_rank0("Loaded vocab mapping successfully")
-    print_with_rank("Loaded vocab mapping")
+    
+    print_on_rank0(f"Data: {len(train_dataloader.dataset):,} samples, {len(train_dataloader)} steps/epoch")
+    if eval_dataloader is not None:
+        print_on_rank0(f"Eval: {len(eval_dataloader)} batches")
 
     # Calculate total steps if not provided
     if args.total_steps is None:
@@ -722,25 +650,12 @@ def main():
             len(train_dataloader) / args.draft_accumulation_steps
         )
         args.total_steps = args.num_epochs * steps_per_epoch
-        print_with_rank(
-            f"Auto-calculated total_steps: {args.total_steps} (num_epochs={args.num_epochs} * steps_per_epoch={steps_per_epoch})"
-        )
-    else:
-        print_with_rank(f"Using provided total_steps: {args.total_steps}")
 
-    # ================================================
-    # 4. Build Eagle3 model
-    # ================================================
-    print_on_rank0("\n" + "=" * 80)
-    print_on_rank0("Building Eagle3 Model")
-    print_on_rank0("=" * 80)
-    print_on_rank0(f"TTT length: {args.ttt_length}, Attention backend: {args.attention_backend}")
-    
+    # Build Eagle3 model
     if (
         args.is_vlm
         and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
     ):
-        print_on_rank0("Creating QwenVLOnlineEagle3Model (VLM mode)")
         eagle3_model = QwenVLOnlineEagle3Model(
             target_model=target_model,
             draft_model=draft_model,
@@ -749,14 +664,12 @@ def main():
             attention_backend=args.attention_backend,
         )
     else:
-        print_on_rank0("Creating OnlineEagle3Model")
         eagle3_model = OnlineEagle3Model(
             draft_model=draft_model,
             length=args.ttt_length,
             attention_backend=args.attention_backend,
         )
 
-    print_on_rank0("Wrapping Eagle3 model with FSDP...")
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -765,18 +678,10 @@ def main():
             buffer_dtype=torch.bfloat16,
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
-        process_group=dist.group.WORLD,  # the draft model should run dp for all processes
+        process_group=dist.group.WORLD,
     )
-    print_on_rank0("Eagle3 FSDP model initialized successfully")
-    print_with_rank("Initialized Eagle3 FSDP model")
 
-    # ================================================
-    # 5. Build optimizer and scheduler
-    # ================================================
-    print_on_rank0("\n" + "=" * 80)
-    print_on_rank0("Building Optimizer and Scheduler")
-    print_on_rank0("=" * 80)
-    print_on_rank0(f"Learning rate: {args.learning_rate}, Max grad norm: {args.max_grad_norm}, Warmup ratio: {args.warmup_ratio}")
+    # Build optimizer and tracker
     optimizer = BF16Optimizer(
         draft_model,
         lr=args.learning_rate,
@@ -784,17 +689,9 @@ def main():
         warmup_ratio=args.warmup_ratio,
         total_steps=args.total_steps,
     )
-    print_on_rank0("Optimizer and scheduler initialized successfully")
-    print_with_rank("Initialized optimizer and scheduler")
-
-    # ================================================
-    # 6. Build tracker
-    # ================================================
-    print_on_rank0("\n" + "=" * 80)
-    print_on_rank0("Building Tracker")
-    print_on_rank0("=" * 80)
     tracker = build_tracker(args, parser)
-    print_on_rank0(f"Tracker initialized: {args.report_to if hasattr(args, 'report_to') else 'default'}")
+    
+    print_on_rank0(f"Config: TTT={args.ttt_length}, backend={args.attention_backend}, lr={args.learning_rate}, steps={args.total_steps}")
     
     global_step = 0
     start_epoch = 0
@@ -802,23 +699,13 @@ def main():
 
     last_time = time.time()
 
-    # ================================================
-    # 7. Start training
-    # ================================================
-    print_on_rank0("\n" + "=" * 80)
-    print_on_rank0("Starting Training Loop")
-    print_on_rank0("=" * 80)
-    print_on_rank0(f"Starting training from epoch {start_epoch} for {args.num_epochs} epochs")
-    print_on_rank0(f"Total steps: {args.total_steps}, Eval interval: {args.eval_interval}, Save interval: {args.save_interval}")
+    # Start training
+    print_on_rank0(f"\nStarting training: {args.num_epochs} epochs, eval every {args.eval_interval} steps, save every {args.save_interval} steps\n")
 
     for epoch in range(start_epoch, args.num_epochs):
         # Run training
-        print_on_rank0(f"\n{'='*80}")
-        print_on_rank0(f"Epoch {epoch + 1}/{args.num_epochs} (Global step: {global_step})")
-        print_on_rank0(f"{'='*80}")
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
-        print_on_rank0("Draft model set to training mode")
 
         if dist.get_rank() == 0:
             progress_bar = tqdm(
@@ -886,15 +773,12 @@ def main():
             if dist.get_rank() == 0:
                 progress_bar.set_postfix({"loss": f"{avg_loss:.3f}", "acc": f"{avg_acc:.1%}"})
 
-            # ================================================
-            # 7.2 Evaluation Step
-            # ================================================
+            # Evaluation
             if (
                 args.eval_data_path is not None
                 and global_step % args.eval_interval == 0
             ):
-                # Run evaluation
-                print_on_rank0(f"\nRunning evaluation at step {global_step}...")
+                print_on_rank0(f"\n[Eval @ step {global_step}]")
                 draft_model.eval()
                 eval_acces = [[] for _ in range(eagle3_model.length)]
                 eval_plosses = [[] for _ in range(eagle3_model.length)]
@@ -924,14 +808,10 @@ def main():
                     mode="eval",
                 )
 
-            # ================================================
-            # 7.3 Save Checkpoints
-            # ================================================
+            # Save checkpoints
             if global_step % args.save_interval == 0:
-                # Save the model
-                print_on_rank0(f"\nSaving checkpoint at step {global_step}...")
+                print_on_rank0(f"\n[Checkpoint @ step {global_step}]")
                 save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
-                print_on_rank0(f"Checkpoint saved successfully at step {global_step}")
 
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
@@ -939,15 +819,10 @@ def main():
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
 
-    # Close the tracker
-    print_on_rank0("\n" + "=" * 80)
-    print_on_rank0("Training Completed")
-    print_on_rank0("=" * 80)
-    print_on_rank0(f"Final global step: {global_step}")
+    # Cleanup
+    print_on_rank0(f"\nTraining completed: {global_step} steps")
     tracker.close()
-    print_on_rank0("Tracker closed")
     destroy_distributed()
-    print_on_rank0("Distributed environment destroyed")
 
 
 if __name__ == "__main__":
