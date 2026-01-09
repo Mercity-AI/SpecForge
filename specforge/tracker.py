@@ -133,10 +133,30 @@ class WandbTracker(Tracker):
                 project=args.wandb_project, name=args.wandb_name, config=vars(args)
             )
             self.is_initialized = True
+            # Test log to verify wandb is working
+            wandb.log({"test/initialization": 1.0}, step=0)
+            if args.verbose if hasattr(args, 'verbose') else False:
+                print(f"WandbTracker initialized: project={args.wandb_project}, name={args.wandb_name}, run_id={wandb.run.id if wandb.run else None}")
 
     def log(self, log_dict: Dict[str, Any], step: Optional[int] = None):
         if self.rank == 0 and self.is_initialized:
-            wandb.log(log_dict, step=step)
+            # Ensure step is an integer
+            if step is not None:
+                step = int(step)
+            # Debug: Print what we're sending to wandb
+            if self.args.verbose if hasattr(self.args, 'verbose') else False:
+                print(f"WandbTracker.log: Sending to wandb - step={step}, log_dict={log_dict}")
+                # Verify values are actually numbers
+                for k, v in log_dict.items():
+                    if not isinstance(v, (int, float)):
+                        print(f"WARNING: {k} is not a number, type={type(v)}, value={v}")
+            try:
+                wandb.log(log_dict, step=step)
+            except Exception as e:
+                print(f"ERROR: wandb.log() failed: {e}")
+                print(f"  log_dict: {log_dict}")
+                print(f"  step: {step}")
+                raise
 
     def close(self):
         if self.rank == 0 and self.is_initialized and wandb.run:

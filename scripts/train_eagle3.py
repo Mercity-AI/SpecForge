@@ -1,7 +1,14 @@
+# Usage: 
+#   --target-model-path Qwen/Qwen2.5-3B-Instruct \
+#   --train-data-path ./cache/dataset/ultrachat_train.jsonl \
+#   --output-dir ./outputs/eagle3_run \
+#   --batch-size 1 --max-length 512
+
+# wandb: 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
+
 import argparse
 import hashlib
 import math
-import wandb
 import os
 import time
 from argparse import ArgumentParser, Namespace
@@ -63,156 +70,68 @@ def get_gpu_memory_gb() -> float:
     return torch.cuda.memory_allocated() / 1e9
 
 def parse_args() -> Tuple[ArgumentParser, Namespace]:
-    """
-    This function is used to parse the arguments for the training script.
-    """
     parser = argparse.ArgumentParser(description="Train Eagle3 with online data")
 
-    # add model-related arguments
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--target-model-path", type=str, required=True)
-    model_group.add_argument(
-        "--draft-model-config",
-        type=str,
-        required=False,
-        help="Draft model config path. If not provided, will auto-generate from target model.",
-    )
-    model_group.add_argument(
-        "--embedding-key",
-        type=str,
-        default="model.embed_tokens.weight",
-        help="The key of the embedding weight to load from the target model",
-    )
-    model_group.add_argument(
-        "--lm-head-key",
-        type=str,
-        default="lm_head.weight",
-        help="The key of the lm head weight to load from the target model, this is only required for offline training",
-    )
-    model_group.add_argument(
-        "--is-vlm", action="store_true", help="Whether the target model is a VLM"
-    )
-    model_group.add_argument(
-        "--target-model-backend",
-        type=str,
-        default="sglang",
-        choices=["sglang", "hf", "custom"],
-        help="The backend of the target model",
-    )
+    model_group.add_argument("--draft-model-config", type=str, required=False)
+    model_group.add_argument("--embedding-key", type=str, default="model.embed_tokens.weight")
+    model_group.add_argument("--lm-head-key", type=str, default="lm_head.weight")
+    model_group.add_argument("--is-vlm", action="store_true")
+    model_group.add_argument("--target-model-backend", type=str, default="sglang", choices=["sglang", "hf", "custom"])
 
-    # dataset arguments
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
     dataset_group.add_argument("--chat-template", type=str, default="llama3")
-    dataset_group.add_argument(
-        "--is-preformatted",
-        action="store_true",
-        help="Whether the input data is preformatted text with the chat template already applied to the conversation messages.",
-    )
+    dataset_group.add_argument("--is-preformatted", action="store_true")
     dataset_group.add_argument("--build-dataset-num-proc", type=int, default=8)
 
-    # training hyper params
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=10)
-    training_group.add_argument(
-        "--max-num-steps",
-        type=int,
-        default=None,
-        help="The maximum number of steps to train. If not provided, will be calculated as num_epochs * steps_per_epoch",
-    )
+    training_group.add_argument("--max-num-steps", type=int, default=None)
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=1e-4)
     training_group.add_argument("--max-length", type=int, default=2048)
     training_group.add_argument("--warmup-ratio", type=float, default=0.015)
-    training_group.add_argument(
-        "--total-steps",
-        type=int,
-        default=None,
-        help="Total training steps. If not provided, will be calculated as num_epochs * steps_per_epoch",
-    )
+    training_group.add_argument("--total-steps", type=int, default=None)
     training_group.add_argument("--max-grad-norm", type=float, default=0.5)
-    training_group.add_argument(
-        "--ttt-length",
-        type=int,
-        default=7,
-        help="The length for Test-Time Training (TTT).",
-    )
+    training_group.add_argument("--ttt-length", type=int, default=7)
     training_group.add_argument("--resume", action="store_true")
-    training_group.add_argument(
-        "--ckpt-dir",
-        type=str,
-        default=None,
-        help="directory includes the checkpoint to start training with",
-    )
+    training_group.add_argument("--ckpt-dir", type=str, default=None)
     training_group.add_argument("--eval-interval", type=int, default=5000)
     training_group.add_argument("--save-interval", type=int, default=5000)
-    training_group.add_argument(
-        "--log-interval",
-        type=int,
-        default=50,
-        help="Log training metrics every N steps",
-    )
+    training_group.add_argument("--log-interval", type=int, default=50)
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
 
-    # data processing type
     optimization_group = parser.add_argument_group("optimization")
-    optimization_group.add_argument(
-        "--tp-size",
-        type=int,
-        default=1,
-        help="The size of the tensor parallel for the target model",
-    )
-    optimization_group.add_argument(
-        "--attention-backend",
-        type=str,
-        default="flex_attention",
-        help="The attention backend for the draft model",
-    )
+    optimization_group.add_argument("--tp-size", type=int, default=1)
+    optimization_group.add_argument("--attention-backend", type=str, default="flex_attention")
 
-    # other args
     other_group = parser.add_argument_group("others")
     other_group.add_argument("--cache-key", type=str, default=None)
     other_group.add_argument("--cache-dir", type=str, default="./cache")
     other_group.add_argument("--output-dir", type=str, required=True)
     other_group.add_argument("--verbose", action="store_true")
-    other_group.add_argument(
-        "--dist-timeout",
-        type=int,
-        default=20,
-        help="Timeout for collective communication in minutes",
-    )
-    other_group.add_argument(
-        "--model-download-dir",
-        type=str,
-        default=None,
-        help="The directory to download the target model to",
-    )
+    other_group.add_argument("--dist-timeout", type=int, default=20)
+    other_group.add_argument("--model-download-dir", type=str, default=None)
 
-    # vlm related args
     vlm_group = parser.add_argument_group("vlm")
-    vlm_group.add_argument(
-        "--min-pixels", type=int, default=50176
-    )  # 64*28*28 for qwen2.5-vl
-    vlm_group.add_argument(
-        "--max-pixels", type=int, default=802816
-    )  # 1024*28*28 for qwen2.5-vl
+    vlm_group.add_argument("--min-pixels", type=int, default=50176)
+    vlm_group.add_argument("--max-pixels", type=int, default=802816)
 
-    # profiling related args
     profiling_group = parser.add_argument_group("profiling")
     profiling_group.add_argument("--profile", action="store_true")
     profiling_group.add_argument("--profile-start-step", type=int, default=30)
     profiling_group.add_argument("--profile-num-steps", type=int, default=4)
     profiling_group.add_argument("--profile-record-shapes", action="store_true")
 
-    # sglang target model backend related args
     sglang_group = parser.add_argument_group("sglang target model backend")
     SGLangBackendArgs.add_args(sglang_group)
 
-    # tracker related args
     tracker_group = parser.add_argument_group("tracker")
     TrackerArgs.add_args(tracker_group)
 
@@ -221,16 +140,6 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
 
 
 def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
-    """
-    Build the experiment tracker according to the report_to argument.
-
-    Args:
-        args: The arguments for the training script.
-        parser: The parser for the training script.
-
-    Returns:
-        The experiment tracker.
-    """
     tracker_class = get_tracker_class(args.report_to)
     if tracker_class:
         tracker_class.validate_args(parser, args)
@@ -243,16 +152,6 @@ def build_tracker(args: Namespace, parser: ArgumentParser) -> Tracker:
 def build_target_model(
     args: Namespace, draft_model_config: AutoDraftModelConfig, is_online: bool = True
 ) -> Tuple[Union[Eagle3TargetModel, TargetHead], Optional[AutoProcessor]]:
-    """
-    Build the target model according to the arguments.
-
-    Args:
-        args: The arguments for the training script.
-        draft_model_config: The draft model config.
-
-    Returns:
-        The target model.
-    """
     if is_online:
         if (
             args.is_vlm
@@ -260,7 +159,6 @@ def build_target_model(
             and args.tp_size == 1
         ):
             from transformers import Qwen2_5_VLForConditionalGeneration
-
             target_model = (
                 Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     pretrained_model_name_or_path=args.target_model_path,
@@ -283,7 +181,6 @@ def build_target_model(
                 **target_model_kwargs,
             )
 
-        # set the aux hidden states layers
         if (
             hasattr(draft_model_config, "eagle_config")
             and draft_model_config.eagle_config is not None
@@ -315,21 +212,11 @@ def build_target_model(
 
 
 def sanity_check(args: Namespace) -> None:
-    """
-    Perform sanity checks on the arguments.
-
-    Args:
-        args: The arguments for the training script.
-
-    Returns:
-        None
-    """
     args.dp_size = dist.get_world_size() // args.tp_size
     args.target_batch_size = args.tp_size * args.batch_size
 
 
 def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]:
-    # Handle draft model config
     if args.draft_model_config is None:
         auto_config_path = create_draft_config_from_target(
             target_model_path=args.target_model_path, cache_dir=args.model_download_dir
@@ -338,7 +225,6 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
     else:
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
-    # Handle base ckpt, config file
     draft_model_last_checkpoint = None
     if args.ckpt_dir is not None:
         if os.path.isdir(args.ckpt_dir):
@@ -346,11 +232,8 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
             draft_model_last_checkpoint = args.ckpt_dir
             print_on_rank0(f"Finetuning from base model: {draft_model_last_checkpoint}")
         else:
-            raise ValueError(
-                f"Provided base model dir {args.ckpt_dir} is not a valid directory."
-            )
+            raise ValueError(f"Provided base model dir {args.ckpt_dir} is not a valid directory.")
 
-    # detecting last ckpt for draft model
     if args.resume and os.path.isdir(args.output_dir):
         draft_model_last_checkpoint = get_last_checkpoint(args.output_dir)
         if draft_model_last_checkpoint:
@@ -383,16 +266,13 @@ def build_dataloaders(
     draft_model_config: AutoDraftModelConfig,
     processor: Optional[AutoProcessor] = None,
 ) -> Tuple[DataLoader, str, Optional[DataLoader]]:
-    
-    # build dataloaders
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
-    # convert to dataloader
     cache_params_string = (
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}"  # Tokenizer may also different
+        f"{args.target_model_path}"
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
@@ -462,12 +342,7 @@ def build_dataloaders(
     else:
         eval_dataloader = None
 
-
-    return (
-        train_dataloader,
-        vocab_mapping_path,
-        eval_dataloader,
-    )
+    return train_dataloader, vocab_mapping_path, eval_dataloader
 
 
 def save_checkpoints(
@@ -525,7 +400,6 @@ def run_forward(
         )
     else:
         if is_online:
-            # we generate the eagle3 using the target model in an online fashion
             eagle3_data = target_model.generate_eagle3_data(
                 input_ids=data["input_ids"].cuda(),
                 attention_mask=data["attention_mask"].cuda(),
@@ -538,7 +412,6 @@ def run_forward(
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
         else:
-            # we generate the logits using the hidden states loaded from disk
             input_ids = data["input_ids"].cuda()
             attention_mask = data["attention_mask"].cuda()
             loss_mask = data["loss_mask"].cuda()
@@ -586,32 +459,75 @@ def record_metrcs(
     if mode == "train" and optimizer is not None:
         logdict["train/lr"] = optimizer.get_learning_rate()
 
-    accuracies = torch.stack(accuracies)
-    plosses = torch.stack(plosses)
-
-    assert accuracies.shape[0] == args.ttt_length
-    dist.all_reduce(accuracies, op=dist.ReduceOp.AVG)
-    accuracies = accuracies.cpu().tolist()
-    for i in range(len(accuracies)):
-        logdict[f"{mode}/acc_{i}"] = accuracies[i]
+    # Stack tensors directly (they should already be detached or we'll detach them)
+    # Each tensor in the list should be a scalar (0-dimensional) tensor
+    accuracies_tensor = torch.stack([acc.detach() if isinstance(acc, torch.Tensor) else torch.tensor(acc, device="cuda") for acc in accuracies])
+    plosses_tensor = torch.stack([pl.detach() if isinstance(pl, torch.Tensor) else torch.tensor(pl, device="cuda") for pl in plosses])
+    
+    # Ensure tensors are on CUDA for all_reduce
+    if accuracies_tensor.device.type != "cuda":
+        accuracies_tensor = accuracies_tensor.cuda()
+    if plosses_tensor.device.type != "cuda":
+        plosses_tensor = plosses_tensor.cuda()
+    
+    assert accuracies_tensor.shape[0] == args.ttt_length
+    
+    # Debug: Check values BEFORE all_reduce
+    if args.verbose and dist.get_rank() == 0:
+        print_on_rank0(f"DEBUG: Before all_reduce - accuracies: {accuracies_tensor.cpu().tolist()}, plosses: {plosses_tensor.cpu().tolist()}")
+    
+    # Average across all processes
+    dist.all_reduce(accuracies_tensor, op=dist.ReduceOp.AVG)
+    dist.all_reduce(plosses_tensor, op=dist.ReduceOp.AVG)
+    
+    # Debug: Check values AFTER all_reduce
+    if args.verbose and dist.get_rank() == 0:
+        print_on_rank0(f"DEBUG: After all_reduce - accuracies: {accuracies_tensor.cpu().tolist()}, plosses: {plosses_tensor.cpu().tolist()}")
+    
+    # Extract values AFTER all_reduce to get the averaged values
+    accuracies_list = []
+    plosses_list = []
+    for i in range(args.ttt_length):
+        acc_val = accuracies_tensor[i].item()
+        loss_val = plosses_tensor[i].item()
+        accuracies_list.append(acc_val)
+        plosses_list.append(loss_val)
+    
+    for i in range(len(accuracies_list)):
+        acc_value = float(accuracies_list[i])
+        # Ensure it's a native Python float, not numpy/torch type
+        acc_value = float(acc_value)
+        logdict[f"{mode}/acc_{i}"] = acc_value
         print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {accuracies[i]:.2f}"
+            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i},  Acc: {acc_value:.2f}"
         )
 
-    dist.all_reduce(plosses, op=dist.ReduceOp.AVG)
-    plosses = plosses.cpu().tolist()
-    for i in range(len(plosses)):
-        logdict[f"{mode}/ploss_{i}"] = plosses[i]
+    for i in range(len(plosses_list)):
+        loss_value = float(plosses_list[i])
+        # Ensure it's a native Python float, not numpy/torch type
+        loss_value = float(loss_value)
+        logdict[f"{mode}/ploss_{i}"] = loss_value
         print_on_rank0(
-            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {plosses[i]}"
+            f"Eval - Step {global_step} [{global_step + 1}/{args.num_epochs}], position {i}, pLoss: {loss_value}"
         )
+    
+    # Tracker.log() already handles rank 0 check internally
+    # Debug output (only if --verbose flag is set)
+    if args.verbose and dist.get_rank() == 0:
+        print_on_rank0(f"DEBUG: Logdict values: {[(k, v) for k, v in logdict.items() if 'acc' in k or 'ploss' in k]}")
+        print_on_rank0(f"DEBUG: Logdict types: {[(k, type(v).__name__) for k, v in logdict.items() if 'acc' in k or 'ploss' in k]}")
+        print_on_rank0(f"DEBUG: Tracker type: {type(tracker).__name__}, initialized: {tracker.is_initialized}, rank: {tracker.rank}")
+        # Verify values are not zero
+        non_zero_values = [(k, v) for k, v in logdict.items() if ('acc' in k or 'ploss' in k) and v != 0.0]
+        if len(non_zero_values) == 0:
+            print_on_rank0("WARNING: All logged values are zero!")
+        else:
+            print_on_rank0(f"DEBUG: Non-zero values: {non_zero_values[:3]}...")  # Show first 3
+    
     tracker.log(logdict, step=global_step)
 
 
 def get_dp_data_shard_from_tp(tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Get the data shard from the tensor.
-    """
     tp_size = dist.get_world_size(get_tp_group())
     tp_rank = dist.get_rank(get_tp_group())
     return tensor.chunk(tp_size, dim=0)[tp_rank]
@@ -628,14 +544,6 @@ def main():
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
     sanity_check(args)
-
-    # In main(), after parse_args and init_distributed, add:
-    if dist.get_rank() == 0:
-        wandb.init(
-            project="eagle3-training",  # change this
-            name=f"{os.path.basename(args.target_model_path)}_{args.seed}",
-            config=vars(args),
-        )
     
     print_on_rank0(f"Training: {args.target_model_path} -> {args.output_dir}")
     print_on_rank0(f"Mode: {'online' if is_online else 'offline'}, World size: {dist.get_world_size()}, TP: {args.tp_size}, DP: {args.dp_size}")
@@ -713,7 +621,6 @@ def main():
     print_on_rank0(f"\nStarting training: {args.num_epochs} epochs, eval every {args.eval_interval} steps, save every {args.save_interval} steps\n")
 
     for epoch in range(start_epoch, args.num_epochs):
-        # Run training
         train_dataloader.sampler.set_epoch(epoch + 1)
         draft_model.train()
 
@@ -728,10 +635,9 @@ def main():
             global_step += 1
 
             # ================================================
-            # 7.0 Profiling
+            # Profiling
             # ================================================
             if args.profile:
-                # we add the step by 1 to align with global step
                 if global_step == args.profile_start_step + 1:
                     print("Start profile")
                     torch_profiler = torch.profiler.profile(
@@ -753,20 +659,19 @@ def main():
                     torch_profiler.export_chrome_trace(output_path)
 
             # ================================================
-            # 7.1 Training Step
+            # Training Step
             # ================================================
             plosses, acces = run_forward(
                 args, eagle3_model, data, target_model, is_online
             )
             run_backward_and_update(args, plosses, optimizer, global_step)
 
-            # log training metrics
+            # Log training metrics
             if global_step % args.log_interval == 0:
                 record_metrcs(
                     args, acces, plosses, global_step, tracker, optimizer, mode="train"
                 )
 
-            # REPLACE WITH:
             time_per_step = time.time() - last_time
             last_time = time.time()
             avg_loss = sum(pl.item() for pl in plosses) / len(plosses)
@@ -779,18 +684,11 @@ def main():
                     f"lr={optimizer.get_learning_rate():.2e} "
                     f"t={time_per_step:.1f}s gpu={get_gpu_memory_gb():.1f}GB"
                 )
-
-                # Add this:
-                if dist.get_rank() == 0:
-                    wandb.log({
-                        "train/loss": avg_loss,
-                        "train/acc": avg_acc,
-                        "train/lr": optimizer.get_learning_rate(),
-                        "train/step_time": time_per_step,
-                        "train/gpu_memory_gb": get_gpu_memory_gb(),
-                        **{f"train/loss_{i}": plosses[i].item() for i in range(len(plosses))},
-                        **{f"train/acc_{i}": acces[i].item() for i in range(len(acces))},
-                    }, step=global_step)
+                # Per-position losses
+                loss_str = " ".join([f"L{i}={plosses[i].item():.4f}" for i in range(len(plosses))])
+                acc_str = " ".join([f"A{i}={acces[i].item():.1%}" for i in range(len(acces))])
+                print_on_rank0(f"  Losses: {loss_str}")
+                print_on_rank0(f"  Accs:   {acc_str}")
 
             if dist.get_rank() == 0:
                 progress_bar.set_postfix({"loss": f"{avg_loss:.3f}", "acc": f"{avg_acc:.1%}"})
@@ -817,7 +715,6 @@ def main():
                             eval_plosses[i] + [plosses[i]] for i in range(len(plosses))
                         ]
 
-                # compute average over all minibatches
                 eval_acces = [torch.stack(acc).mean() for acc in eval_acces]
                 eval_plosses = [torch.stack(pl).mean() for pl in eval_plosses]
 
@@ -829,6 +726,11 @@ def main():
                     tracker,
                     mode="eval",
                 )
+                
+                # Log eval summary
+                eval_avg_loss = sum(pl.item() for pl in eval_plosses) / len(eval_plosses)
+                eval_avg_acc = sum(acc.item() for acc in eval_acces) / len(eval_acces)
+                print_on_rank0(f"  Eval avg: loss={eval_avg_loss:.4f} acc={eval_avg_acc:.1%}")
 
             # Save checkpoints
             if global_step % args.save_interval == 0:
@@ -840,9 +742,6 @@ def main():
 
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
-
-    if dist.get_rank() == 0:
-        wandb.finish()
 
     # Cleanup
     print_on_rank0(f"\nTraining completed: {global_step} steps")
