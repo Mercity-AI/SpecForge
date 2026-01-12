@@ -20,7 +20,7 @@ ROLE_MAPPING = {
 DATASETS = [
     "nemotron",
     "science-qna", 
-    "roleplay",
+    "soda",
     "lmsys",
     "ultrachat",
 ]
@@ -152,8 +152,8 @@ def get_dataset_and_proc_fn(name: str):
         ds = load_dataset("169Pi/Science-QnA", split="train", streaming=True)
         return ds, process_science_qna_row
         
-    elif name == "roleplay":
-        ds = load_dataset("agentlans/combined-roleplay", split="train", streaming=True)
+    elif name == "soda":
+        ds = load_dataset("agentlans/combined-roleplay", "multiturn_mix_v3_k30000", split="train", streaming=True)
         return ds, process_roleplay_row
         
     elif name == "lmsys":

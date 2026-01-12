@@ -105,7 +105,10 @@ class GeneralParser(Parser):
             + re.escape(self.user_message_separator)
             + "|$)"
         )
+        
+        matches_found = 0
         for match in re.finditer(assistant_pattern, conversation, re.DOTALL):
+            matches_found += 1
             # Assistant response text span (excluding assistant_header itself)
             assistant_start_char = match.start(1)
             assistant_end_char = match.end(1)
@@ -118,6 +121,21 @@ class GeneralParser(Parser):
                 if token_start > assistant_end_char:
                     continue  # token after assistant text
                 loss_mask[idx] = 1
+        
+        # DEBUG: If no matches found, print info to help diagnose
+        if matches_found == 0:
+            import os
+            # Only print on rank 0 and only once in a while to avoid flooding
+            if os.environ.get("RANK", "0") == "0":
+                print("\n" + "="*50)
+                print("DEBUG: NO ASSISTANT SPANS FOUND IN CONVERSATION!")
+                print(f"Assistant separator being sought: {repr(self.assistant_message_separator)}")
+                print(f"User separator being sought:      {repr(self.user_message_separator)}")
+                print("-" * 20)
+                print("Formatted conversation text (first 500 chars):")
+                print(repr(conversation[:500]))
+                print("="*50 + "\n")
+                
         return input_ids, loss_mask
 
 

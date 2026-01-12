@@ -634,6 +634,14 @@ def main():
         for data in progress_bar:
             global_step += 1
 
+            # Check for empty loss masks
+            if "loss_mask" in data:
+                mask_sum = data["loss_mask"].sum().item()
+                if mask_sum == 0:
+                    print_on_rank0(f"WARNING: Empty loss_mask at step {global_step}! The model is not learning anything. Check your chat template and data format.")
+                elif args.verbose and global_step % args.log_interval == 0:
+                    print_on_rank0(f"DEBUG: loss_mask sum = {mask_sum}")
+            
             # ================================================
             # Profiling
             # ================================================
