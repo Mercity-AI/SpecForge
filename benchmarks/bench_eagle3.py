@@ -91,8 +91,7 @@ def parse_args():
             "math500:200",
             "ceval:200",
         ],
-        help=f"The list of benchmarks to run. The format is <benchmark-name>:<num-prompts>:<subset>,<subset>. We support the following benchmarks: {', '.join(BENCHMARKS.benchmarks.keys())}",
-    )
+        help=f"The list of benchmarks to run. The format is <benchmark-name>:<num-prompts>:<subset>,<subset>. We support the following benchmarks: {', '.join(BENCHMARKS.benchmarks.keys())}",    )
     benchmark_group.add_argument(
         "--enable-multi-turn-conversation",
         action="store_true",
