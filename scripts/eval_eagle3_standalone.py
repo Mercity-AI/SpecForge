@@ -19,7 +19,6 @@ import torch
 from transformers import AutoTokenizer
 
 from specforge import AutoEagle3DraftModel
-from specforge.modeling.target import get_eagle3_target_model
 from specforge.data.template import TEMPLATE_REGISTRY
 
 
@@ -380,15 +379,22 @@ def main():
     # Load models
     draft_model = AutoEagle3DraftModel.from_pretrained(
         args.draft_model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
     ).to(args.device).eval()
     
-    target_model = get_eagle3_target_model(
+    # For HF backend, we need to load the model directly to avoid distributed issues
+    from transformers import AutoModelForCausalLM
+    target_model_hf = AutoModelForCausalLM.from_pretrained(
         args.target_model_path,
-        backend="hf",  # Use HF backend instead of SGLang
         torch_dtype=torch.bfloat16,
-        device=args.device,
-    )
+        device_map=args.device,
+    ).eval()
+    
+    # Wrap in HFEagle3TargetModel manually
+    from specforge.modeling.target.eagle3_target_model import HFEagle3TargetModel
+    target_model = HFEagle3TargetModel(target_model_hf)
+    # Set aux hidden states layers (required for Eagle3)
+    target_model.set_aux_hidden_states_layers()
     target_model.eval()
     
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
