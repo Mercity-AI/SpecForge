@@ -9,12 +9,6 @@ Usage:
         --draft-checkpoint ./outputs/qwen-8b-eagle3/epoch_0_step_2000 \
         --target-model-path Qwen/Qwen2.5-7B-Instruct
 
-    # With vocab mapping from cache directory
-    python scripts/eval_eagle.py \
-        --draft-checkpoint ./outputs/model/epoch_0_step_1000 \
-        --target-model-path Qwen/Qwen2.5-7B-Instruct \
-        --vocab-mapping-path ./cache/vocab_mapping/abc123.pt
-
     # With more prompts
     python scripts/eval_eagle.py \
         --draft-checkpoint ./outputs/model/epoch_0_step_1000 \
@@ -125,12 +119,6 @@ def parse_args() -> argparse.Namespace:
         default="hf",
         choices=["hf", "sglang"],
     )
-    parser.add_argument(
-        "--vocab-mapping-path",
-        type=str,
-        default=None,
-        help="Path to vocab_mapping.pt (default: looks in checkpoint dir, then ./cache/vocab_mapping/)",
-    )
 
     return parser.parse_args()
 
@@ -180,35 +168,6 @@ def main():
 
     draft_params = count_params(draft_model)
     print(f"   Parameters: {fmt_params(draft_params)}")
-
-    # Load vocab mapping - check multiple locations
-    vocab_mapping_path = None
-    if args.vocab_mapping_path and os.path.exists(args.vocab_mapping_path):
-        vocab_mapping_path = args.vocab_mapping_path
-    elif os.path.exists(os.path.join(checkpoint_path, "vocab_mapping.pt")):
-        vocab_mapping_path = os.path.join(checkpoint_path, "vocab_mapping.pt")
-    else:
-        # Try common cache locations
-        cache_candidates = [
-            "./cache/vocab_mapping",
-            "../cache/vocab_mapping",
-        ]
-        for cache_dir in cache_candidates:
-            if os.path.isdir(cache_dir):
-                # Find any .pt file in the cache dir
-                for f in os.listdir(cache_dir):
-                    if f.endswith(".pt"):
-                        vocab_mapping_path = os.path.join(cache_dir, f)
-                        break
-            if vocab_mapping_path:
-                break
-
-    if vocab_mapping_path and os.path.exists(vocab_mapping_path):
-        draft_model.load_vocab_mapping(vocab_mapping_path)
-        print(f"   Loaded vocab mapping from: {vocab_mapping_path}")
-    else:
-        print("   ⚠️  No vocab mapping found! Results may be inaccurate.")
-        print("      Use --vocab-mapping-path to specify location")
 
     # Load target model
     print(f"\n🎯 Loading target model: {args.target_model_path}")
