@@ -748,6 +748,10 @@ def main():
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
 
+        # End-of-epoch checkpoint
+        print_on_rank0(f"\n[End of Epoch {epoch} - Checkpoint @ step {global_step}]")
+        save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)
+
         if args.max_num_steps is not None and global_step >= args.max_num_steps:
             break
 

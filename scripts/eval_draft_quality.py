@@ -15,6 +15,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 from tqdm import tqdm
@@ -47,7 +48,7 @@ def evaluate_draft_quality(
 ):
     """Evaluate draft model quality by measuring position-wise accuracy."""
     draft_model.eval()
-    target_model.eval()
+    target_model.model.eval()  # Set underlying HF model to eval mode
     
     # Statistics
     position_accuracies = [[] for _ in range(7)]  # Assuming TTT length of 7
@@ -197,7 +198,7 @@ def main():
     target_model = HFEagle3TargetModel(target_model_hf)
     # Set aux hidden states layers (required for Eagle3)
     target_model.set_aux_hidden_states_layers()
-    target_model.eval()
+    # Note: target_model_hf is already in eval mode, no need to call eval() on wrapper
     
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     
