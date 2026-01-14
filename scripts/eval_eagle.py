@@ -5,9 +5,16 @@ EAGLE3 Draft Model Evaluation Script
 Simple evaluation on a few prompts to check accuracy and speed.
 
 Usage:
+    # Basic usage (regular python)
     python scripts/eval_eagle.py \
         --draft-checkpoint ./outputs/qwen-8b-eagle3/epoch_0_step_2000 \
         --target-model-path Qwen/Qwen2.5-7B-Instruct
+
+    # For MLA models (DeepSeek-V2, etc.)
+    python scripts/eval_eagle.py \
+        --draft-checkpoint ./outputs/eagle3-mla/epoch_9_step_300 \
+        --target-model-path deepseek-ai/DeepSeek-V2-Lite \
+        --attention-backend flex_attention_mla
 
     # With vocab mapping from cache directory
     python scripts/eval_eagle.py \
@@ -15,8 +22,8 @@ Usage:
         --target-model-path Qwen/Qwen2.5-7B-Instruct \
         --vocab-mapping-path ./cache/vocab_mapping/abc123.pt
 
-    # With more prompts
-    python scripts/eval_eagle.py \
+    # Also supports torchrun (not required)
+    torchrun --nproc_per_node=1 scripts/eval_eagle.py \
         --draft-checkpoint ./outputs/model/epoch_0_step_1000 \
         --target-model-path Qwen/Qwen2.5-7B-Instruct \
         --num-samples 10
@@ -28,6 +35,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
@@ -35,6 +43,7 @@ from transformers import AutoConfig, AutoTokenizer
 from specforge import AutoDraftModelConfig, AutoEagle3DraftModel
 from specforge.core.eagle3 import OnlineEagle3Model
 from specforge.data.template import TEMPLATE_REGISTRY
+from specforge.distributed import init_distributed
 from specforge.modeling.target import get_eagle3_target_model
 
 
@@ -131,6 +140,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to vocab_mapping.pt (default: looks in checkpoint dir, then ./cache/vocab_mapping/)",
     )
+    parser.add_argument(
+        "--attention-backend",
+        type=str,
+        default="flex_attention",
+        choices=["sdpa", "flex_attention", "flex_attention_mla"],
+        help="Attention backend (use flex_attention_mla for MLA models like DeepSeek-V2)",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show detailed token predictions for debugging",
+    )
+    parser.add_argument(
+        "--show-first-n-positions",
+        type=int,
+        default=20,
+        help="Number of positions to show in verbose mode (default: 20)",
+    )
 
     return parser.parse_args()
 
@@ -153,6 +180,80 @@ def count_params(model: nn.Module) -> int:
 
 
 # ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+
+def get_draft_predictions(eagle3_model, eagle3_data, ttt_length, attention_backend):
+    """Get draft model predictions for each TTT position."""
+    from transformers.cache_utils import DynamicCache
+    from specforge.utils import padding
+    
+    draft_model = eagle3_model.draft_model
+    input_ids = eagle3_data.input_ids
+    attention_mask = eagle3_data.attention_mask
+    hidden_states = eagle3_data.hidden_states
+    
+    batch_size, seq_length = input_ids.shape
+    device = hidden_states.device
+    
+    # Project hidden states
+    hidden_states = draft_model.project_hidden_states(hidden_states)
+    
+    # Initialize cache
+    if attention_backend == "sdpa" or attention_backend == "flex_attention_mla":
+        cache_hidden = [[], []]
+        past_key_values = None
+    elif attention_backend == "flex_attention":
+        cache_hidden = None
+        past_key_values = DynamicCache()
+    
+    # Store predictions for each TTT position
+    all_predictions = []
+    
+    # Initialize position_ids
+    past_key_values_length = 0
+    position_ids = torch.arange(
+        past_key_values_length,
+        seq_length + past_key_values_length,
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+    
+    for idx in range(ttt_length):
+        # Embed input ids
+        inputs_embeds = draft_model.embed_input_ids(input_ids)
+        inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+        
+        # Run backbone
+        hidden_states_out = draft_model.backbone(
+            input_embeds=inputs_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        
+        hidden_states = hidden_states_out
+        
+        # Get logits and predictions
+        logits = draft_model.compute_logits(hidden_states)
+        predictions = logits.argmax(dim=-1)  # [batch, seq_len]
+        all_predictions.append(predictions)
+        
+        # Pad for next iteration (except last)
+        if idx < ttt_length - 1:
+            input_ids = padding(input_ids, left=False)
+            # Also pad position_ids to match
+            position_ids = padding(position_ids, left=False)
+    
+    return all_predictions
+
+
+# ==============================================================================
 # Main Evaluation
 # ==============================================================================
 
@@ -160,6 +261,15 @@ def count_params(model: nn.Module) -> int:
 def main():
     args = parse_args()
     num_samples = min(args.num_samples, len(TEST_PROMPTS))
+
+    # Initialize distributed if running with torchrun
+    if 'RANK' in os.environ or 'LOCAL_RANK' in os.environ:
+        # Running with torchrun - initialize distributed
+        init_distributed(timeout=10, tp_size=1)
+        print(f"Initialized distributed: rank {dist.get_rank()}, world size {dist.get_world_size()}")
+    else:
+        # Running with regular python - no distributed needed
+        print("Running in single-process mode (use python, not torchrun)")
 
     print("\n" + "=" * 60)
     print("EAGLE3 EVALUATION")
@@ -174,7 +284,7 @@ def main():
     print(f"\n📦 Loading draft model from: {checkpoint_path}")
     draft_model = AutoEagle3DraftModel.from_pretrained(
         checkpoint_path,
-        attention_backend="flex_attention",
+        attention_backend=args.attention_backend,
         torch_dtype=torch.bfloat16,
     ).to(args.device).eval()
 
@@ -251,7 +361,7 @@ def main():
     eagle3_model = OnlineEagle3Model(
         draft_model=draft_model,
         length=args.ttt_length,
-        attention_backend="flex_attention",
+        attention_backend=args.attention_backend,
     ).to(args.device).eval()
 
     # Get chat template
@@ -287,6 +397,12 @@ def main():
         attention_mask = inputs["attention_mask"].to(args.device)
         loss_mask = attention_mask.clone()
 
+        if args.verbose:
+            print(f"\n{'='*80}")
+            print(f"Sample {i+1}/{num_samples}: {prompt[:60]}...")
+            print(f"{'='*80}")
+            print(f"Input length: {input_ids.shape[1]} tokens")
+
         # Evaluate
         start = time.time()
 
@@ -306,6 +422,15 @@ def main():
                 target=eagle3_data.target,
                 hidden_states=eagle3_data.hidden_states,
             )
+            
+            # If verbose, also get draft predictions separately
+            if args.verbose:
+                draft_predictions = get_draft_predictions(
+                    eagle3_model, 
+                    eagle3_data, 
+                    args.ttt_length,
+                    args.attention_backend
+                )
 
         elapsed = time.time() - start
         total_time += elapsed
@@ -317,7 +442,73 @@ def main():
             all_losses[j].append(loss.item())
 
         mean_acc = sum(a.item() for a in acces) / len(acces)
-        print(f"  [{i+1}/{num_samples}] \"{prompt[:40]}...\" → acc={mean_acc:.1%} ({elapsed:.2f}s)")
+        
+        if args.verbose:
+            # Show detailed predictions for first N positions
+            print(f"\n📊 Detailed Predictions (showing first {args.show_first_n_positions} positions):")
+            print(f"\nLegend: TTT=Time-to-Target offset (0 means predicting next token, 1 means +1 position ahead, etc.)")
+            print(f"\n{'Pos':<4} {'TTT':<3} {'Context (last 3 tokens)':<50} {'Draft':<20} {'Target':<20} {'✓/✗':<3}")
+            print("-" * 120)
+            
+            # Get target tokens (ground truth from target model logits)
+            target_tokens = eagle3_data.target.argmax(dim=-1)[0]  # [seq_len]
+            input_tokens = input_ids[0].tolist()  # [seq_len]
+            
+            # Show predictions for each position
+            num_positions_to_show = min(args.show_first_n_positions, input_ids.shape[1] - args.ttt_length)
+            
+            for pos_idx in range(num_positions_to_show):
+                # Show context (last 3 tokens before prediction point)
+                context_start = max(0, pos_idx - 2)
+                context_tokens = input_tokens[context_start:pos_idx+1]
+                context_text = tokenizer.decode(context_tokens, skip_special_tokens=False)
+                context_text = repr(context_text)[1:-1]  # Escape special chars
+                context_text = ("..." + context_text[-47:]) if len(context_text) > 50 else context_text
+                
+                # For each TTT position (0 to ttt_length-1)
+                for ttt_idx in range(args.ttt_length):
+                    # Draft model predicts token at position pos_idx + ttt_idx
+                    target_pos = pos_idx + ttt_idx
+                    
+                    if target_pos >= len(target_tokens):
+                        break
+                    
+                    # Get draft prediction
+                    draft_pred = draft_predictions[ttt_idx][0, pos_idx].item()
+                    target_token = target_tokens[target_pos].item()
+                    
+                    match = "✓" if draft_pred == target_token else "✗"
+                    
+                    # Decode tokens
+                    draft_text = tokenizer.decode([draft_pred], skip_special_tokens=False)
+                    target_text = tokenizer.decode([target_token], skip_special_tokens=False)
+                    
+                    # Escape special characters for display
+                    draft_text = repr(draft_text)[1:-1]  # Remove outer quotes from repr
+                    target_text = repr(target_text)[1:-1]
+                    
+                    # Truncate long tokens
+                    draft_text = (draft_text[:17] + "...") if len(draft_text) > 20 else draft_text
+                    target_text = (target_text[:17] + "...") if len(target_text) > 20 else target_text
+                    
+                    # Only show context for first TTT position
+                    if ttt_idx == 0:
+                        print(f"{pos_idx:<4} {ttt_idx:<3} {context_text:<50} {draft_text:<20} {target_text:<20} {match:<3}")
+                    else:
+                        print(f"{'':4} {ttt_idx:<3} {'':50} {draft_text:<20} {target_text:<20} {match:<3}")
+                
+                # Add separator between positions
+                if pos_idx < num_positions_to_show - 1 and pos_idx % 5 == 4:
+                    print()
+            
+            print(f"\n{'='*80}")
+            print(f"Per-TTT Position Accuracy:")
+            for ttt_pos, acc in enumerate(acces):
+                print(f"  TTT Position {ttt_pos}: {acc.item():.1%}")
+            print(f"  Mean: {mean_acc:.1%}")
+            print(f"{'='*80}\n")
+        else:
+            print(f"  [{i+1}/{num_samples}] \"{prompt[:40]}...\" → acc={mean_acc:.1%} ({elapsed:.2f}s)")
 
     # Compute final metrics
     per_pos_acc = [sum(accs) / len(accs) for accs in all_accs]
