@@ -4,8 +4,6 @@
 #   --output-dir ./outputs/eagle3_run \
 #   --batch-size 1 --max-length 512
 
-# wandb: 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
-
 import argparse
 import hashlib
 import math
