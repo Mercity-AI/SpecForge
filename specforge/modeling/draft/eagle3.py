@@ -15,10 +15,6 @@ from specforge.modeling.draft.flex_attention import (
     compile_friendly_flex_attention,
     generate_eagle3_mask,
 )
-from specforge.modeling.draft.mla_flex_attn import (
-    compile_mla_flex_attention,
-    compile_block_mask,
-)
 
 from specforge.utils import print_with_rank
 from .base import Eagle3DraftModel
@@ -737,11 +733,11 @@ class EagleFlexMLA(nn.Module):
             if self.rope_dim > 0:
                 q_rope = self.W_qr(hidden_states)
                 k_rope_new = self.W_kr(hidden_states)
-                q_rope = apply_rotary_pos_emb_single(q_rope, cos, sin, position_ids)
-                k_rope_new = apply_rotary_pos_emb_single(k_rope_new, cos, sin, position_ids)
+                q_rope = apply_rotary_pos_emb_single(q_rope, cos, sin, position_ids + lck)
+                k_rope_new = apply_rotary_pos_emb_single(k_rope_new, cos, sin, position_ids + lck)
             else:
                 query_states, _ = apply_rotary_pos_emb(
-                    query_states, query_states, cos, sin, position_ids
+                    query_states, query_states, cos, sin, position_ids + lck
                 )
             
             # Decompress current step
@@ -754,12 +750,12 @@ class EagleFlexMLA(nn.Module):
             value_states = value_states.view(
                 bsz, q_len, self.num_key_value_heads, self.head_dim
             ).transpose(1, 2)
-            
+
             if self.rope_dim == 0:
                 _, key_states = apply_rotary_pos_emb(
-                    key_states, key_states, cos, sin, position_ids
+                    key_states, key_states, cos, sin, position_ids + lck
                 )
-            
+
             # GQA
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -786,8 +782,8 @@ class EagleFlexMLA(nn.Module):
                 create_block_mask_func = create_block_mask
                 flex_attention_func = flex_attention
             else:
-                create_block_mask_func = compile_block_mask
-                flex_attention_func = compile_mla_flex_attention
+                create_block_mask_func = compile_friendly_create_block_mask
+                flex_attention_func = compile_friendly_flex_attention
             
             # Create EAGLE3 mask
             block_mask = create_block_mask_func(

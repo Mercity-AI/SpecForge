@@ -145,6 +145,11 @@ class OnlineEagle3Model(Eagle3Model):
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        elif self.attention_backend == "flex_attention_mla":
+            cache_hidden = [[], []]  # MLA uses list-based cache like SDPA
+            past_key_values = None
+        else:
+            raise ValueError(f"Unknown attention_backend: {self.attention_backend}")
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :]
@@ -435,6 +440,11 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
             past_key_values = DynamicCache()
+        elif self.attention_backend == "flex_attention_mla":
+            cache_hidden = [[], []]  # MLA uses list-based cache like SDPA
+            past_key_values = None
+        else:
+            raise ValueError(f"Unknown attention_backend: {self.attention_backend}")
 
         for idx in range(self.length):
             target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
