@@ -174,7 +174,7 @@ def main():
     print(f"\n📦 Loading draft model from: {checkpoint_path}")
     draft_model = AutoEagle3DraftModel.from_pretrained(
         checkpoint_path,
-        attention_backend="flex_attention",
+        attention_backend="flex_attention_mla",
         torch_dtype=torch.bfloat16,
     ).to(args.device).eval()
 
