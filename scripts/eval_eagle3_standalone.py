@@ -473,15 +473,27 @@ def generate_speculative(
     else:
         next_token = next_logits.argmax(dim=-1, keepdim=True)
     
-    prefill_end = time.perf_counter()
-    metrics.prefill_time = prefill_end - prefill_start
-    metrics.ttft = metrics.prefill_time
-    
     generated_tokens.append(next_token.item())
     
     # Update current sequence
     current_ids = torch.cat([current_ids, next_token], dim=1)
     current_mask = torch.cat([current_mask, torch.ones((1, 1), device=device)], dim=1)
+    
+    # Get updated hidden states that include the first generated token
+    # This is necessary because draft model needs hidden states matching current_ids length
+    with torch.no_grad():
+        target_outputs = target_model(
+            input_ids=current_ids,
+            attention_mask=current_mask,
+            use_cache=True,
+            output_hidden_states=True,
+        )
+        target_past_kv = target_outputs.past_key_values
+        target_hidden = get_aux_hidden_states(target_outputs.hidden_states, aux_layer_ids)
+    
+    prefill_end = time.perf_counter()
+    metrics.prefill_time = prefill_end - prefill_start
+    metrics.ttft = metrics.prefill_time
     
     # Decode phase with speculative decoding
     decode_start = time.perf_counter()
