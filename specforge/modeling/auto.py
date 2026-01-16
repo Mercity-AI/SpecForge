@@ -36,7 +36,9 @@ class AutoEagle3DraftModel(AutoModelForCausalLMBase):
     # the model mapping is currently hardcoded, we should support lazy model mapping via registry
     _model_mapping = {
         # LlamaConfig: LlamaForCausalLMEagle3,
-        LlamaConfig: EagleForCausalLM
+        LlamaConfig: EagleForCausalLM,
+        Qwen3Config: EagleForCausalLM,
+        GptOssConfig: EagleForCausalLM
     }
 
     @classmethod

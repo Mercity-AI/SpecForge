@@ -1,38 +1,68 @@
 ---
+
 name: Fix MLA Implementation
+
 overview: "Fix multiple bugs in EagleFlexMLA: missing position offsets in RoPE, wrong flex_attention function, and missing OnlineEagle3Model handler. Then update evaluation script to support MLA backend."
+
 todos:
+
   - id: fix-rope-offset-decoupled
-    content: Add + lck to position_ids in decoupled RoPE (lines 740-741)
-    status: pending
+
+content: Add + lck to position_ids in decoupled RoPE (lines 740-741)
+
+status: pending
+
   - id: fix-rope-offset-query
-    content: Add + lck to position_ids in query RoPE (lines 743-745)
-    status: pending
+
+content: Add + lck to position_ids in query RoPE (lines 743-745)
+
+status: pending
+
   - id: fix-rope-offset-key
-    content: Add + lck to position_ids in key RoPE (lines 759-761)
-    status: pending
+
+content: Add + lck to position_ids in key RoPE (lines 759-761)
+
+status: pending
+
   - id: fix-flex-attention-func
-    content: Replace compile_mla_flex_attention with compile_friendly_flex_attention (lines 788-790)
-    status: pending
-    dependencies:
+
+content: Replace compile_mla_flex_attention with compile_friendly_flex_attention (lines 788-790)
+
+status: pending
+
+dependencies:
+
       - fix-rope-offset-decoupled
       - fix-rope-offset-query
       - fix-rope-offset-key
   - id: add-mla-handler
-    content: Add flex_attention_mla case to OnlineEagle3Model cache handling
-    status: pending
-    dependencies:
+
+content: Add flex_attention_mla case to OnlineEagle3Model cache handling
+
+status: pending
+
+dependencies:
+
       - fix-flex-attention-func
   - id: update-eval-script
-    content: Add --attention-backend CLI argument to eval_eagle.py
-    status: pending
-    dependencies:
+
+content: Add --attention-backend CLI argument to eval_eagle.py
+
+status: pending
+
+dependencies:
+
       - add-mla-handler
   - id: test-mla-eval
-    content: Test evaluation with --attention-backend flex_attention_mla
-    status: pending
-    dependencies:
+
+content: Test evaluation with --attention-backend flex_attention_mla
+
+status: pending
+
+dependencies:
+
       - update-eval-script
+
 ---
 
 # Fix MLA Implementation - Comprehensive Bug Fix

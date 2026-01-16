@@ -31,6 +31,7 @@ Usage:
 
 import argparse
 import os
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -386,22 +387,59 @@ def main():
             messages = [{"role": "system", "content": template.system_prompt}] + messages
         messages.append({"role": "assistant", "content": response})
 
-        # Tokenize
+        # Tokenize (matching training behavior)
         try:
             text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         except Exception:
             text = f"{template.user_header}{prompt}{template.end_of_turn_token}{template.assistant_header}{response}{template.end_of_turn_token}"
 
-        inputs = tokenizer(text, return_tensors="pt", max_length=args.max_length, truncation=True)
+        inputs = tokenizer(
+            text, 
+            return_tensors="pt", 
+            return_offsets_mapping=True,
+            max_length=args.max_length, 
+            truncation=True,
+            add_special_tokens=False,  # Match training
+        )
         input_ids = inputs["input_ids"].to(args.device)
         attention_mask = inputs["attention_mask"].to(args.device)
-        loss_mask = attention_mask.clone()
+        offsets = inputs["offset_mapping"][0]
+        
+        # Build loss mask like training does (only assistant tokens contribute)
+        loss_mask = torch.zeros(input_ids.shape[1], dtype=torch.long, device=args.device)
+        
+        user_sep = f"{template.end_of_turn_token or ''}{template.user_header}"
+        asst_sep = f"{template.end_of_turn_token or ''}{template.assistant_header}"
+        assistant_pattern = re.escape(asst_sep) + r"(.*?)(?=" + re.escape(user_sep) + "|$)"
+        
+        matches_found = 0
+        for match in re.finditer(assistant_pattern, text, re.DOTALL):
+            matches_found += 1
+            start_char = match.start(1)
+            end_char = match.end(1)
+            for idx, (tok_start, tok_end) in enumerate(offsets):
+                if tok_end > start_char and tok_start <= end_char:
+                    loss_mask[idx] = 1
+        
+        # Warn if no assistant spans found (matching training behavior)
+        if matches_found == 0:
+            print(f"\n⚠️  WARNING: No assistant spans found in sample {i+1}!")
+            print(f"   Assistant separator: {repr(asst_sep)}")
+            print(f"   Text preview: {repr(text[:200])}...")
+        
+        loss_mask = loss_mask.unsqueeze(0)  # Add batch dimension
 
         if args.verbose:
+            assistant_tokens = loss_mask.sum().item()
+            total_tokens = input_ids.shape[1]
             print(f"\n{'='*80}")
             print(f"Sample {i+1}/{num_samples}: {prompt[:60]}...")
             print(f"{'='*80}")
-            print(f"Input length: {input_ids.shape[1]} tokens")
+            print(f"Input length: {total_tokens} tokens ({assistant_tokens} assistant tokens in loss mask)")
+        elif i == 0:
+            # Show token counts for first sample even in non-verbose mode
+            assistant_tokens = loss_mask.sum().item()
+            print(f"   (Loss mask: {assistant_tokens}/{input_ids.shape[1]} tokens are assistant responses)")
 
         # Evaluate
         start = time.time()
