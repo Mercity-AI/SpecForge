@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Evaluation script using prompts from train.jsonl dataset.
-Performs speculative decoding and reports metrics.
+EAGLE3 Draft Model Evaluation on train.jsonl dataset.
+
+Evaluates draft model prediction accuracy on prompts from train.jsonl,
+matching the evaluation approach used in eval_eagle.py.
 
 Usage:
     python scripts/eval_evalset.py \
@@ -18,70 +20,33 @@ Usage:
         --vocab-mapping-path ./cache/vocab_mapping/abc123.pt \
         --attention-backend flex_attention_mla \
         --num-samples 5
+
+    # Verbose mode with token-level predictions
+    python scripts/eval_evalset.py \
+        --draft-checkpoint ./outputs/qwen-8b-eagle3/epoch_0_step_2000 \
+        --target-model-path Qwen/Qwen2.5-7B-Instruct \
+        --data-path ./cache/dataset/ultrachat_train.jsonl \
+        --num-samples 5 \
+        --verbose
 """
 
 import argparse
 import json
 import os
+import re
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
+import torch.nn as nn
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from specforge import AutoEagle3DraftModel
+from specforge.core.eagle3 import OnlineEagle3Model
 from specforge.data.template import TEMPLATE_REGISTRY
-
-
-# ==============================================================================
-# Data Classes
-# ==============================================================================
-
-
-@dataclass
-class TimingMetrics:
-    """Timing metrics for a single generation."""
-    ttft: float = 0.0  # Time to first token
-    total_time: float = 0.0  # Total generation time
-    tokens_generated: int = 0
-    prefill_time: float = 0.0
-    decode_time: float = 0.0
-
-    # Speculative decoding specific
-    accept_count: int = 0
-    draft_count: int = 0
-    num_spec_steps: int = 0
-
-    @property
-    def throughput(self) -> float:
-        """Tokens per second."""
-        if self.total_time > 0:
-            return self.tokens_generated / self.total_time
-        return 0.0
-
-    @property
-    def decode_throughput(self) -> float:
-        """Tokens per second (decode only, excluding prefill)."""
-        if self.decode_time > 0:
-            return self.tokens_generated / self.decode_time
-        return 0.0
-
-    @property
-    def accept_rate(self) -> float:
-        """Draft token acceptance rate."""
-        if self.draft_count > 0:
-            return self.accept_count / self.draft_count
-        return 0.0
-
-    @property
-    def avg_accepted_per_step(self) -> float:
-        """Average tokens accepted per speculative step."""
-        if self.num_spec_steps > 0:
-            return self.accept_count / self.num_spec_steps
-        return 0.0
+from specforge.modeling.target import get_eagle3_target_model
 
 
 # ==============================================================================
@@ -89,8 +54,8 @@ class TimingMetrics:
 # ==============================================================================
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate EAGLE3 on train.jsonl dataset")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate EAGLE3 draft model on train.jsonl")
 
     parser.add_argument(
         "--draft-checkpoint",
@@ -123,27 +88,27 @@ def parse_args():
         help="Chat template (default: qwen)",
     )
     parser.add_argument(
-        "--max-new-tokens",
+        "--ttt-length",
         type=int,
-        default=128,
-        help="Max tokens to generate (default: 128)",
+        default=7,
+        help="TTT length - positions to predict ahead (default: 7)",
     )
     parser.add_argument(
-        "--max-prompt-length",
+        "--max-length",
         type=int,
         default=512,
-        help="Max prompt length (default: 512)",
-    )
-    parser.add_argument(
-        "--num-draft-tokens",
-        type=int,
-        default=4,
-        help="Draft tokens per speculative step (default: 4)",
+        help="Max sequence length (default: 512)",
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    parser.add_argument(
+        "--target-model-backend",
+        type=str,
+        default="hf",
+        choices=["hf", "sglang"],
     )
     parser.add_argument(
         "--vocab-mapping-path",
@@ -154,29 +119,40 @@ def parse_args():
     parser.add_argument(
         "--attention-backend",
         type=str,
-        default="sdpa",
+        default="flex_attention",
         choices=["sdpa", "flex_attention", "flex_attention_mla"],
         help="Attention backend (use flex_attention_mla for MLA models like DeepSeek-V2)",
     )
     parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.0,
-        help="Sampling temperature (0=greedy, default: 0.0)",
-    )
-    parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Show generated text for each sample",
+        help="Show detailed token predictions for debugging",
     )
     parser.add_argument(
-        "--warmup",
+        "--show-first-n-positions",
         type=int,
-        default=2,
-        help="Number of warmup iterations (default: 2)",
+        default=20,
+        help="Number of positions to show in verbose mode (default: 20)",
     )
 
     return parser.parse_args()
+
+
+# ==============================================================================
+# Utilities
+# ==============================================================================
+
+
+def fmt_params(n: int) -> str:
+    if n >= 1e9:
+        return f"{n / 1e9:.2f}B"
+    elif n >= 1e6:
+        return f"{n / 1e6:.2f}M"
+    return f"{n / 1e3:.2f}K"
+
+
+def count_params(model: nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
 
 
 # ==============================================================================
@@ -213,319 +189,117 @@ def load_samples_from_jsonl(data_path: str, num_samples: int) -> List[Dict]:
     return samples
 
 
-def prepare_prompt(
-    tokenizer,
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
+
+
+def get_draft_predictions(eagle3_model, eagle3_data, ttt_length, attention_backend):
+    """Get draft model predictions for each TTT position."""
+    from transformers.cache_utils import DynamicCache
+    from specforge.utils import padding
+
+    draft_model = eagle3_model.draft_model
+    input_ids = eagle3_data.input_ids
+    attention_mask = eagle3_data.attention_mask
+    hidden_states = eagle3_data.hidden_states
+
+    batch_size, seq_length = input_ids.shape
+    device = hidden_states.device
+
+    # Project hidden states
+    hidden_states = draft_model.project_hidden_states(hidden_states)
+
+    # Initialize cache
+    if attention_backend == "sdpa" or attention_backend == "flex_attention_mla":
+        cache_hidden = [[], []]
+        past_key_values = None
+    elif attention_backend == "flex_attention":
+        cache_hidden = None
+        past_key_values = DynamicCache()
+
+    # Store predictions for each TTT position
+    all_predictions = []
+
+    # Initialize position_ids
+    past_key_values_length = 0
+    position_ids = torch.arange(
+        past_key_values_length,
+        seq_length + past_key_values_length,
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+
+    for idx in range(ttt_length):
+        # Embed input ids
+        inputs_embeds = draft_model.embed_input_ids(input_ids)
+        inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+
+        # Run backbone
+        hidden_states_out = draft_model.backbone(
+            input_embeds=inputs_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+
+        hidden_states = hidden_states_out
+
+        # Get logits and predictions
+        logits = draft_model.compute_logits(hidden_states)
+        predictions = logits.argmax(dim=-1)  # [batch, seq_len]
+        all_predictions.append(predictions)
+
+        # Pad for next iteration (except last)
+        if idx < ttt_length - 1:
+            input_ids = padding(input_ids, left=False)
+            # Also pad position_ids to match
+            position_ids = padding(position_ids, left=False)
+
+    return all_predictions
+
+
+def build_text_from_conversations(
     conversations: List[Dict],
-    max_length: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Prepare prompt from conversation (only user turns, no assistant response).
-    Returns input_ids and attention_mask for generation.
-    """
-    # Take only the first user message for generation prompt
+    tokenizer,
+    template,
+) -> str:
+    """Build full text from conversations including assistant responses."""
+    # Build messages list
     messages = []
+    if template.system_prompt:
+        messages.append({"role": "system", "content": template.system_prompt})
+
     for conv in conversations:
-        if conv["role"] == "user":
-            messages.append({"role": "user", "content": conv["content"]})
-            break  # Only first user turn
+        role = conv.get("role", "")
+        content = conv.get("content", "")
+        if role in ["user", "assistant", "system"] and content:
+            messages.append({"role": role, "content": content})
 
-    if not messages:
-        messages = [{"role": "user", "content": "Hello, how are you?"}]
-
-    # Apply chat template with generation prompt
+    # Apply chat template
     try:
         text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=False
         )
     except Exception:
-        # Fallback
-        text = f"User: {messages[0]['content']}\nAssistant:"
+        # Fallback: manual construction
+        parts = []
+        for msg in messages:
+            if msg["role"] == "user":
+                parts.append(f"{template.user_header}{msg['content']}{template.end_of_turn_token or ''}")
+            elif msg["role"] == "assistant":
+                parts.append(f"{template.assistant_header}{msg['content']}{template.end_of_turn_token or ''}")
+            elif msg["role"] == "system":
+                parts.append(f"{msg['content']}")
+        text = "".join(parts)
 
-    # Tokenize
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        max_length=max_length,
-        truncation=True,
-        add_special_tokens=True,
-    )
-
-    return inputs["input_ids"], inputs["attention_mask"]
-
-
-# ==============================================================================
-# Speculative Decoding
-# ==============================================================================
-
-
-def get_aux_hidden_states(
-    hidden_states_tuple: Tuple[torch.Tensor, ...],
-    aux_layer_ids: List[int],
-) -> torch.Tensor:
-    """
-    Extract and concatenate hidden states from auxiliary layers.
-    Eagle3 uses multiple layers' hidden states concatenated together.
-    """
-    aux_hidden = []
-    for layer_id in aux_layer_ids:
-        # Layer outputs are offset by 1 (index 0 is embeddings)
-        idx = layer_id + 1 if layer_id < len(hidden_states_tuple) - 1 else layer_id
-        if idx < len(hidden_states_tuple):
-            aux_hidden.append(hidden_states_tuple[idx])
-
-    if not aux_hidden:
-        # Fallback: use last layer hidden states repeated 3 times
-        return torch.cat([hidden_states_tuple[-1]] * 3, dim=-1)
-
-    return torch.cat(aux_hidden, dim=-1)
-
-
-def generate_speculative(
-    target_model,
-    draft_model,
-    tokenizer,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    max_new_tokens: int,
-    num_draft_tokens: int = 4,
-    temperature: float = 0.0,
-    aux_layer_ids: Optional[List[int]] = None,
-) -> Tuple[List[int], TimingMetrics]:
-    """
-    Speculative decoding using Eagle3's draft prediction.
-    Returns generated tokens and timing metrics.
-    """
-    metrics = TimingMetrics()
-    device = input_ids.device
-
-    # Determine aux layer IDs for hidden state extraction
-    if aux_layer_ids is None:
-        draft_config = draft_model.config
-        if (
-            hasattr(draft_config, "eagle_config")
-            and draft_config.eagle_config
-            and "eagle_aux_hidden_state_layer_ids" in draft_config.eagle_config
-        ):
-            aux_layer_ids = draft_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
-        else:
-            num_layers = getattr(draft_config, "num_hidden_layers", 32)
-            aux_layer_ids = [num_layers // 3, 2 * num_layers // 3, num_layers]
-
-    generated_tokens = []
-    current_ids = input_ids.clone()
-    current_mask = attention_mask.clone()
-
-    # Prefill phase - get initial hidden states from target
-    prefill_start = time.perf_counter()
-
-    with torch.no_grad():
-        target_outputs = target_model(
-            input_ids=current_ids,
-            attention_mask=current_mask,
-            use_cache=True,
-            output_hidden_states=True,
-        )
-        target_past_kv = target_outputs.past_key_values
-        target_hidden = get_aux_hidden_states(target_outputs.hidden_states, aux_layer_ids)
-        next_logits = target_outputs.logits[:, -1, :]
-
-    # Sample first token
-    if temperature > 0:
-        probs = torch.softmax(next_logits / temperature, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-    else:
-        next_token = next_logits.argmax(dim=-1, keepdim=True)
-
-    generated_tokens.append(next_token.item())
-
-    # Update current sequence
-    current_ids = torch.cat([current_ids, next_token], dim=1)
-    current_mask = torch.cat([current_mask, torch.ones((1, 1), device=device)], dim=1)
-
-    # Get updated hidden states
-    with torch.no_grad():
-        target_outputs = target_model(
-            input_ids=current_ids,
-            attention_mask=current_mask,
-            use_cache=True,
-            output_hidden_states=True,
-        )
-        target_past_kv = target_outputs.past_key_values
-        target_hidden = get_aux_hidden_states(target_outputs.hidden_states, aux_layer_ids)
-
-    prefill_end = time.perf_counter()
-    metrics.prefill_time = prefill_end - prefill_start
-    metrics.ttft = metrics.prefill_time
-
-    # Decode phase with speculative decoding
-    decode_start = time.perf_counter()
-
-    while len(generated_tokens) < max_new_tokens:
-        if generated_tokens[-1] == tokenizer.eos_token_id:
-            break
-
-        metrics.num_spec_steps += 1
-
-        # === DRAFT PHASE ===
-        draft_tokens = []
-        draft_logits_list = []
-
-        with torch.no_grad():
-            # Project target hidden states
-            last_hidden = target_hidden[:, -1:, :]
-            projected_hidden = draft_model.project_hidden_states(last_hidden)
-
-            # Start from last generated token
-            draft_input = next_token
-            hidden_states = projected_hidden
-
-            for draft_idx in range(num_draft_tokens):
-                # Embed input
-                input_embeds = draft_model.embed_input_ids(draft_input)
-                input_embeds = input_embeds.to(hidden_states.dtype)
-
-                # Create attention mask for single token
-                attn_mask = torch.ones((1, 1), dtype=torch.long, device=device)
-                position_ids = torch.zeros((1, 1), dtype=torch.long, device=device)
-
-                # Run draft backbone
-                hidden_states_out = draft_model.backbone(
-                    input_embeds=input_embeds,
-                    hidden_states=hidden_states,
-                    cache_hidden=[[], []],
-                    attention_mask=attn_mask,
-                    position_ids=position_ids,
-                    past_key_values=None,
-                    use_cache=False,
-                )
-
-                # Get logits
-                draft_logits = draft_model.compute_logits(hidden_states_out)
-                last_logits = draft_logits[:, -1, :]
-                draft_logits_list.append(last_logits)
-
-                if temperature > 0:
-                    probs = torch.softmax(last_logits / temperature, dim=-1)
-                    draft_token = torch.multinomial(probs, num_samples=1)
-                else:
-                    draft_token = last_logits.argmax(dim=-1, keepdim=True)
-
-                draft_tokens.append(draft_token.item())
-
-                if draft_token.item() == tokenizer.eos_token_id:
-                    break
-
-                # For next iteration
-                hidden_states = hidden_states_out[:, -1:, :]
-                draft_input = draft_token
-
-        if not draft_tokens:
-            break
-
-        metrics.draft_count += len(draft_tokens)
-
-        # === VERIFY PHASE ===
-        draft_tensor = torch.tensor([draft_tokens], device=device)
-        verify_ids = torch.cat([next_token, draft_tensor], dim=1)
-
-        with torch.no_grad():
-            verify_outputs = target_model(
-                input_ids=verify_ids,
-                attention_mask=torch.ones((1, current_mask.shape[1] + len(draft_tokens)), device=device),
-                past_key_values=target_past_kv,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            verify_logits = verify_outputs.logits
-
-        # === ACCEPTANCE ===
-        accepted_count = 0
-        bonus_token = None
-
-        for i, draft_token_id in enumerate(draft_tokens):
-            target_logit = verify_logits[:, i, :]
-
-            if temperature > 0:
-                target_probs = torch.softmax(target_logit / temperature, dim=-1)
-                draft_probs = torch.softmax(draft_logits_list[i] / temperature, dim=-1)
-
-                target_prob = target_probs[0, draft_token_id].item()
-                draft_prob = draft_probs[0, draft_token_id].item()
-
-                if draft_prob <= target_prob:
-                    generated_tokens.append(draft_token_id)
-                    accepted_count += 1
-                else:
-                    accept_prob = target_prob / draft_prob
-                    if torch.rand(1).item() < accept_prob:
-                        generated_tokens.append(draft_token_id)
-                        accepted_count += 1
-                    else:
-                        adjusted = torch.clamp(target_probs - draft_probs, min=0)
-                        if adjusted.sum() > 0:
-                            adjusted = adjusted / adjusted.sum()
-                            bonus_token = torch.multinomial(adjusted, 1).item()
-                        else:
-                            bonus_token = target_logit.argmax(dim=-1).item()
-                        break
-            else:
-                # Greedy verification
-                target_token = target_logit.argmax(dim=-1).item()
-                if draft_token_id == target_token:
-                    generated_tokens.append(draft_token_id)
-                    accepted_count += 1
-                else:
-                    bonus_token = target_token
-                    break
-
-            if draft_token_id == tokenizer.eos_token_id:
-                break
-
-        # Add bonus token
-        if bonus_token is not None and generated_tokens[-1] != tokenizer.eos_token_id:
-            generated_tokens.append(bonus_token)
-        elif accepted_count == len(draft_tokens) and generated_tokens[-1] != tokenizer.eos_token_id:
-            last_verify_logit = verify_logits[:, -1, :]
-            if temperature > 0:
-                probs = torch.softmax(last_verify_logit / temperature, dim=-1)
-                bonus_token = torch.multinomial(probs, 1).item()
-            else:
-                bonus_token = last_verify_logit.argmax(dim=-1).item()
-            generated_tokens.append(bonus_token)
-
-        metrics.accept_count += accepted_count
-
-        if len(generated_tokens) >= max_new_tokens:
-            break
-        if generated_tokens[-1] == tokenizer.eos_token_id:
-            break
-
-        # Update state for next iteration
-        new_tokens = generated_tokens[-(accepted_count + (1 if bonus_token is not None else 0)):]
-        new_tokens_tensor = torch.tensor([new_tokens], device=device)
-        current_ids = torch.cat([current_ids, new_tokens_tensor], dim=1)
-        current_mask = torch.cat([current_mask, torch.ones((1, len(new_tokens)), device=device)], dim=1)
-
-        # Update target KV cache and hidden states
-        with torch.no_grad():
-            target_outputs = target_model(
-                input_ids=current_ids,
-                attention_mask=current_mask,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            target_past_kv = target_outputs.past_key_values
-            target_hidden = get_aux_hidden_states(target_outputs.hidden_states, aux_layer_ids)
-            next_token = torch.tensor([[generated_tokens[-1]]], device=device)
-
-    decode_end = time.perf_counter()
-    metrics.decode_time = decode_end - decode_start
-    metrics.total_time = metrics.prefill_time + metrics.decode_time
-    metrics.tokens_generated = len(generated_tokens)
-
-    return generated_tokens, metrics
+    return text
 
 
 # ==============================================================================
@@ -549,36 +323,18 @@ def main():
     if not data_path.exists():
         raise FileNotFoundError(f"Data file not found: {data_path}")
 
-    print(f"\nDraft model: {checkpoint_path}")
-    print(f"Target model: {args.target_model_path}")
-    print(f"Data path: {data_path}")
-    print(f"Samples: {args.num_samples}")
-    print(f"Max new tokens: {args.max_new_tokens}")
-    print(f"Draft tokens per step: {args.num_draft_tokens}")
-
-    # Load tokenizer
-    print(f"\n📝 Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # Load target model
-    print(f"\n🎯 Loading target model...")
-    target_model = AutoModelForCausalLM.from_pretrained(
-        args.target_model_path,
-        torch_dtype=torch.bfloat16,
-        device_map=args.device,
-    ).eval()
-
     # Load draft model
-    print(f"\n📦 Loading draft model...")
+    print(f"\n📦 Loading draft model from: {checkpoint_path}")
     draft_model = AutoEagle3DraftModel.from_pretrained(
         checkpoint_path,
         attention_backend=args.attention_backend,
         torch_dtype=torch.bfloat16,
     ).to(args.device).eval()
 
-    # Load vocab mapping
+    draft_params = count_params(draft_model)
+    print(f"   Parameters: {fmt_params(draft_params)}")
+
+    # Load vocab mapping - check multiple locations
     vocab_mapping_path = None
     if args.vocab_mapping_path and os.path.exists(args.vocab_mapping_path):
         vocab_mapping_path = args.vocab_mapping_path
@@ -592,6 +348,7 @@ def main():
         ]
         for cache_dir in cache_candidates:
             if os.path.isdir(cache_dir):
+                # Find any .pt file in the cache dir
                 for f in os.listdir(cache_dir):
                     if f.endswith(".pt"):
                         vocab_mapping_path = os.path.join(cache_dir, f)
@@ -604,162 +361,284 @@ def main():
         print(f"   Loaded vocab mapping from: {vocab_mapping_path}")
     else:
         print("   ⚠️  No vocab mapping found! Results may be inaccurate.")
+        print("      Use --vocab-mapping-path to specify location")
 
-    # Load samples
+    # Load target model
+    print(f"\n🎯 Loading target model: {args.target_model_path}")
+    target_model = get_eagle3_target_model(
+        pretrained_model_name_or_path=args.target_model_path,
+        backend=args.target_model_backend,
+        torch_dtype=torch.bfloat16,
+        device=args.device,
+    )
+
+    # Set aux hidden states layers
+    draft_config = draft_model.config
+    if (
+        hasattr(draft_config, "eagle_config")
+        and draft_config.eagle_config
+        and "eagle_aux_hidden_state_layer_ids" in draft_config.eagle_config
+    ):
+        target_model.set_aux_hidden_states_layers(
+            draft_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
+        )
+    else:
+        target_model.set_aux_hidden_states_layers()
+
+    # Estimate target params
+    target_config = AutoConfig.from_pretrained(args.target_model_path)
+    target_params = getattr(target_config, "num_parameters", None)
+    if target_params is None:
+        h = target_config.hidden_size
+        n_layers = target_config.num_hidden_layers
+        vocab = target_config.vocab_size
+        inter = getattr(target_config, "intermediate_size", h * 4)
+        target_params = vocab * h * 2 + n_layers * (h * h * 4 + h * inter * 3)
+    print(f"   Parameters: ~{fmt_params(target_params)} (estimated)")
+
+    # Load tokenizer
+    print(f"\n📝 Loading tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
+
+    # Build EAGLE3 model for evaluation
+    eagle3_model = OnlineEagle3Model(
+        draft_model=draft_model,
+        length=args.ttt_length,
+        attention_backend=args.attention_backend,
+    ).to(args.device).eval()
+
+    # Get chat template
+    template = TEMPLATE_REGISTRY.get(args.chat_template)
+
+    # Load samples from jsonl
     print(f"\n📊 Loading samples from {data_path.name}...")
     samples = load_samples_from_jsonl(str(data_path), args.num_samples)
-    print(f"   Loaded {len(samples)} samples")
+    num_samples = len(samples)
+    print(f"   Loaded {num_samples} samples")
 
-    if len(samples) == 0:
+    if num_samples == 0:
         print("❌ No samples found! Exiting.")
         return
 
-    # Warmup
-    if args.warmup > 0:
-        print(f"\n🔥 Warming up ({args.warmup} iterations)...")
-        for i in range(min(args.warmup, len(samples))):
-            input_ids, attention_mask = prepare_prompt(
-                tokenizer, samples[i]["conversations"], args.max_prompt_length
-            )
-            input_ids = input_ids.to(args.device)
-            attention_mask = attention_mask.to(args.device)
-
-            with torch.no_grad():
-                _ = generate_speculative(
-                    target_model=target_model,
-                    draft_model=draft_model,
-                    tokenizer=tokenizer,
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=min(32, args.max_new_tokens),
-                    num_draft_tokens=args.num_draft_tokens,
-                    temperature=args.temperature,
-                )
-
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-        print("   Warmup complete!")
-
-    # Run evaluation
-    print(f"\n🚀 Running speculative decoding evaluation...")
+    # Prepare evaluation
+    print(f"\n📊 Evaluating on {num_samples} samples...")
     print("-" * 60)
 
-    all_metrics = []
-    all_outputs = []
+    all_accs = [[] for _ in range(args.ttt_length)]
+    all_losses = [[] for _ in range(args.ttt_length)]
+    total_tokens = 0
+    total_time = 0.0
 
-    for i, sample in enumerate(tqdm(samples, desc="Generating")):
-        # Prepare prompt (first user message only)
-        input_ids, attention_mask = prepare_prompt(
-            tokenizer, sample["conversations"], args.max_prompt_length
+    for i, sample in enumerate(samples):
+        conversations = sample.get("conversations", [])
+
+        # Build full text with assistant responses
+        text = build_text_from_conversations(conversations, tokenizer, template)
+
+        # Tokenize (matching training behavior)
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+            max_length=args.max_length,
+            truncation=True,
+            add_special_tokens=False,  # Match training
         )
-        input_ids = input_ids.to(args.device)
-        attention_mask = attention_mask.to(args.device)
+        input_ids = inputs["input_ids"].to(args.device)
+        attention_mask = inputs["attention_mask"].to(args.device)
+        offsets = inputs["offset_mapping"][0]
 
-        # Sync before timing
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        # Build loss mask like training does (only assistant tokens contribute)
+        loss_mask = torch.zeros(input_ids.shape[1], dtype=torch.long, device=args.device)
 
-        # Generate
+        user_sep = f"{template.end_of_turn_token or ''}{template.user_header}"
+        asst_sep = f"{template.end_of_turn_token or ''}{template.assistant_header}"
+        assistant_pattern = re.escape(asst_sep) + r"(.*?)(?=" + re.escape(user_sep) + "|$)"
+
+        matches_found = 0
+        for match in re.finditer(assistant_pattern, text, re.DOTALL):
+            matches_found += 1
+            start_char = match.start(1)
+            end_char = match.end(1)
+            for idx, (tok_start, tok_end) in enumerate(offsets):
+                if tok_end > start_char and tok_start <= end_char:
+                    loss_mask[idx] = 1
+
+        # Warn if no assistant spans found (matching training behavior)
+        if matches_found == 0:
+            print(f"\n⚠️  WARNING: No assistant spans found in sample {i+1}!")
+            print(f"   Assistant separator: {repr(asst_sep)}")
+            print(f"   Text preview: {repr(text[:200])}...")
+
+        loss_mask = loss_mask.unsqueeze(0)  # Add batch dimension
+
+        # Get prompt preview
+        prompt_preview = ""
+        for conv in conversations:
+            if conv.get("role") == "user":
+                prompt_preview = conv.get("content", "")[:60]
+                break
+
+        if args.verbose:
+            assistant_tokens = loss_mask.sum().item()
+            total_toks = input_ids.shape[1]
+            print(f"\n{'='*80}")
+            print(f"Sample {i+1}/{num_samples}: {prompt_preview}...")
+            print(f"{'='*80}")
+            print(f"Input length: {total_toks} tokens ({assistant_tokens} assistant tokens in loss mask)")
+        elif i == 0:
+            # Show token counts for first sample even in non-verbose mode
+            assistant_tokens = loss_mask.sum().item()
+            print(f"   (Loss mask: {assistant_tokens}/{input_ids.shape[1]} tokens are assistant responses)")
+
+        # Evaluate
+        start = time.time()
+
         with torch.no_grad():
-            tokens, metrics = generate_speculative(
-                target_model=target_model,
-                draft_model=draft_model,
-                tokenizer=tokenizer,
+            # Get target model data
+            eagle3_data = target_model.generate_eagle3_data(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=args.max_new_tokens,
-                num_draft_tokens=args.num_draft_tokens,
-                temperature=args.temperature,
+                loss_mask=loss_mask,
             )
 
-        # Sync after
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+            # Run EAGLE3 forward pass
+            plosses, _, acces = eagle3_model(
+                input_ids=eagle3_data.input_ids,
+                attention_mask=eagle3_data.attention_mask,
+                loss_mask=eagle3_data.loss_mask,
+                target=eagle3_data.target,
+                hidden_states=eagle3_data.hidden_states,
+            )
 
-        # Decode output
-        output_text = tokenizer.decode(tokens, skip_special_tokens=True)
-        all_metrics.append(metrics)
-        all_outputs.append(output_text)
+            # If verbose, also get draft predictions separately
+            if args.verbose:
+                draft_predictions = get_draft_predictions(
+                    eagle3_model,
+                    eagle3_data,
+                    args.ttt_length,
+                    args.attention_backend
+                )
 
-        # Show progress
+        elapsed = time.time() - start
+        total_time += elapsed
+        total_tokens += input_ids.shape[1]
+
+        # Collect metrics
+        for j, (acc, loss) in enumerate(zip(acces, plosses)):
+            all_accs[j].append(acc.item())
+            all_losses[j].append(loss.item())
+
+        mean_acc = sum(a.item() for a in acces) / len(acces)
+
         if args.verbose:
-            # Get the user prompt
-            user_prompt = ""
-            for conv in sample["conversations"]:
-                if conv["role"] == "user":
-                    user_prompt = conv["content"]
-                    break
+            # Show detailed predictions for first N positions
+            print(f"\n📊 Detailed Predictions (showing first {args.show_first_n_positions} positions):")
+            print(f"\nLegend: TTT=Time-to-Target offset (0 means predicting next token, 1 means +1 position ahead, etc.)")
+            print(f"\n{'Pos':<4} {'TTT':<3} {'Context (last 3 tokens)':<50} {'Draft':<20} {'Target':<20} {'✓/✗':<3}")
+            print("-" * 120)
+
+            # Get target tokens (ground truth from target model logits)
+            target_tokens = eagle3_data.target.argmax(dim=-1)[0]  # [seq_len]
+            input_tokens = input_ids[0].tolist()  # [seq_len]
+
+            # Show predictions for each position
+            num_positions_to_show = min(args.show_first_n_positions, input_ids.shape[1] - args.ttt_length)
+
+            for pos_idx in range(num_positions_to_show):
+                # Show context (last 3 tokens before prediction point)
+                context_start = max(0, pos_idx - 2)
+                context_tokens = input_tokens[context_start:pos_idx+1]
+                context_text = tokenizer.decode(context_tokens, skip_special_tokens=False)
+                context_text = repr(context_text)[1:-1]  # Escape special chars
+                context_text = ("..." + context_text[-47:]) if len(context_text) > 50 else context_text
+
+                # For each TTT position (0 to ttt_length-1)
+                for ttt_idx in range(args.ttt_length):
+                    # Draft model predicts token at position pos_idx + ttt_idx
+                    target_pos = pos_idx + ttt_idx
+
+                    if target_pos >= len(target_tokens):
+                        break
+
+                    # Get draft prediction
+                    draft_pred = draft_predictions[ttt_idx][0, pos_idx].item()
+                    target_token = target_tokens[target_pos].item()
+
+                    match = "✓" if draft_pred == target_token else "✗"
+
+                    # Decode tokens
+                    draft_text = tokenizer.decode([draft_pred], skip_special_tokens=False)
+                    target_text = tokenizer.decode([target_token], skip_special_tokens=False)
+
+                    # Escape special characters for display
+                    draft_text = repr(draft_text)[1:-1]  # Remove outer quotes from repr
+                    target_text = repr(target_text)[1:-1]
+
+                    # Truncate long tokens
+                    draft_text = (draft_text[:17] + "...") if len(draft_text) > 20 else draft_text
+                    target_text = (target_text[:17] + "...") if len(target_text) > 20 else target_text
+
+                    # Only show context for first TTT position
+                    if ttt_idx == 0:
+                        print(f"{pos_idx:<4} {ttt_idx:<3} {context_text:<50} {draft_text:<20} {target_text:<20} {match:<3}")
+                    else:
+                        print(f"{'':4} {ttt_idx:<3} {'':50} {draft_text:<20} {target_text:<20} {match:<3}")
+
+                # Add separator between positions
+                if pos_idx < num_positions_to_show - 1 and pos_idx % 5 == 4:
+                    print()
 
             print(f"\n{'='*80}")
-            print(f"Sample {i+1}/{len(samples)}")
-            print(f"{'='*80}")
-            print(f"Prompt: {user_prompt[:100]}..." if len(user_prompt) > 100 else f"Prompt: {user_prompt}")
-            print(f"\nGenerated Output:\n{output_text}\n")
-            print(f"Tokens: {metrics.tokens_generated}")
-            print(f"TTFT: {metrics.ttft*1000:.1f}ms")
-            print(f"Total time: {metrics.total_time*1000:.1f}ms")
-            print(f"Throughput: {metrics.throughput:.1f} tok/s")
-            print(f"Accept rate: {metrics.accept_rate:.1%}")
-            print(f"Avg accepted/step: {metrics.avg_accepted_per_step:.2f}")
+            print(f"Per-TTT Position Accuracy:")
+            for ttt_pos, acc in enumerate(acces):
+                print(f"  TTT Position {ttt_pos}: {acc.item():.1%}")
+            print(f"  Mean: {mean_acc:.1%}")
             print(f"{'='*80}\n")
+        else:
+            print(f"  [{i+1}/{num_samples}] \"{prompt_preview}...\" → acc={mean_acc:.1%} ({elapsed:.2f}s)")
 
-    # Compute aggregate metrics
+    # Compute final metrics
+    per_pos_acc = [sum(accs) / len(accs) for accs in all_accs]
+    per_pos_loss = [sum(losses) / len(losses) for losses in all_losses]
+    mean_acc = sum(per_pos_acc) / len(per_pos_acc)
+    mean_loss = sum(per_pos_loss) / len(per_pos_loss)
+
+    # Print results
     print("\n" + "=" * 60)
     print("RESULTS")
     print("=" * 60)
 
-    avg_ttft = sum(m.ttft for m in all_metrics) / len(all_metrics)
-    avg_throughput = sum(m.throughput for m in all_metrics) / len(all_metrics)
-    avg_decode_throughput = sum(m.decode_throughput for m in all_metrics) / len(all_metrics)
-    avg_latency = sum(m.total_time for m in all_metrics) / len(all_metrics)
-    avg_tokens = sum(m.tokens_generated for m in all_metrics) / len(all_metrics)
-    avg_accept_rate = sum(m.accept_rate for m in all_metrics if m.draft_count > 0) / len([m for m in all_metrics if m.draft_count > 0])
-    avg_accepted_per_step = sum(m.avg_accepted_per_step for m in all_metrics if m.num_spec_steps > 0) / len([m for m in all_metrics if m.num_spec_steps > 0])
-    total_tokens = sum(m.tokens_generated for m in all_metrics)
-    total_time = sum(m.total_time for m in all_metrics)
+    print("\n📊 Per-Position Accuracy:")
+    for i, (acc, loss) in enumerate(zip(per_pos_acc, per_pos_loss)):
+        bar = "█" * int(acc * 20) + "░" * (20 - int(acc * 20))
+        print(f"   Position {i}: {bar} {acc:.1%}  (loss: {loss:.4f})")
 
-    print(f"\n📊 Aggregate Metrics ({len(all_metrics)} samples):")
-    print(f"   Avg TTFT:              {avg_ttft*1000:.2f} ms")
-    print(f"   Avg Latency:           {avg_latency*1000:.2f} ms")
-    print(f"   Avg Throughput:        {avg_throughput:.2f} tok/s")
-    print(f"   Avg Decode Throughput: {avg_decode_throughput:.2f} tok/s")
-    print(f"   Avg Tokens Generated:  {avg_tokens:.1f}")
-    print(f"   Total Tokens:          {total_tokens:,}")
-    print(f"   Total Time:            {total_time:.2f}s")
+    print("\n📈 Summary:")
+    print(f"   Mean Accuracy:    {mean_acc:.1%}")
+    print(f"   Mean Loss:        {mean_loss:.4f}")
+    print(f"   Total Time:       {total_time:.2f}s")
+    print(f"   Tokens Processed: {total_tokens:,}")
+    print(f"   Throughput:       {total_tokens / total_time:.1f} tokens/s")
 
-    print(f"\n🎯 Speculative Decoding Metrics:")
-    print(f"   Avg Accept Rate:       {avg_accept_rate:.1%}")
-    print(f"   Avg Accepted/Step:     {avg_accepted_per_step:.2f}")
-
-    print(f"\n💡 Quality Assessment:")
-    if avg_accept_rate >= 0.7:
-        print(f"   ✅ EXCELLENT - High acceptance rate indicates strong draft model!")
-    elif avg_accept_rate >= 0.5:
-        print(f"   ⚠️  GOOD - Decent acceptance rate, expect moderate speedup")
-    elif avg_accept_rate >= 0.3:
-        print(f"   ⚠️  FAIR - Lower acceptance rate, limited speedup")
+    # Quality interpretation
+    print("\n💡 Quality:")
+    if mean_acc >= 0.7:
+        print("   ✅ EXCELLENT - Expected speedup: 2.5x - 3.5x")
+    elif mean_acc >= 0.5:
+        print("   ⚠️  GOOD - Expected speedup: 1.5x - 2.5x")
+    elif mean_acc >= 0.3:
+        print("   ⚠️  FAIR - Expected speedup: 1.2x - 1.5x")
     else:
-        print(f"   ❌ NEEDS WORK - Low acceptance rate, may need more training")
+        print("   ❌ NEEDS WORK - Train longer or tune hyperparameters")
 
-    # Show sample outputs if not verbose
-    if not args.verbose and len(all_outputs) > 0:
-        print(f"\n📝 Sample Outputs (first 3):")
-        for i in range(min(3, len(all_outputs))):
-            user_prompt = ""
-            for conv in samples[i]["conversations"]:
-                if conv["role"] == "user":
-                    user_prompt = conv["content"]
-                    break
-
-            print(f"\n  Sample {i+1}:")
-            print(f"  Prompt: {user_prompt[:80]}..." if len(user_prompt) > 80 else f"  Prompt: {user_prompt}")
-            output_preview = all_outputs[i][:150] + "..." if len(all_outputs[i]) > 150 else all_outputs[i]
-            print(f"  Output: {output_preview}")
-            print(f"  Metrics: {all_metrics[i].tokens_generated} tokens, {all_metrics[i].accept_rate:.1%} accept rate")
+    # Decay analysis
+    if per_pos_acc[0] > 0:
+        decay = (per_pos_acc[0] - per_pos_acc[-1]) / per_pos_acc[0] * 100
+        print(f"\n   Accuracy decay (pos 0→{len(per_pos_acc)-1}): {decay:.1f}%")
 
     print("\n" + "=" * 60)
-    print("✅ Evaluation complete!")
+    print("✅ Done!")
 
 
 if __name__ == "__main__":
