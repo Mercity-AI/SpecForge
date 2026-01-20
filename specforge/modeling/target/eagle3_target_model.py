@@ -112,7 +112,8 @@ class HFEagle3TargetModel(Eagle3TargetModel):
         """
         Initialize the HuggingFace target model backend from a pretrained model path.
         """
-        tp_size = get_tp_group().size()
+        tp_group = get_tp_group()
+        tp_size = tp_group.size() if tp_group is not None else 1
 
         if tp_size > 1:
             device_kwargs = {
