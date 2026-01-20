@@ -396,14 +396,19 @@ def get_aux_hidden_states(
     """
     Extract and concatenate hidden states from auxiliary layers.
     Eagle3 uses multiple layers' hidden states concatenated together.
+    
+    Note: hidden_states_tuple includes embeddings at index 0, then layer outputs.
+    So layer 0 output is at index 1, layer 1 at index 2, etc.
     """
     aux_hidden = []
     for layer_id in aux_layer_ids:
-        if layer_id < len(hidden_states_tuple):
-            aux_hidden.append(hidden_states_tuple[layer_id])
+        # Layer outputs are offset by 1 (index 0 is embeddings)
+        idx = layer_id + 1 if layer_id < len(hidden_states_tuple) - 1 else layer_id
+        if idx < len(hidden_states_tuple):
+            aux_hidden.append(hidden_states_tuple[idx])
     
     if not aux_hidden:
-        # Fallback: use last layer repeated
+        # Fallback: use last layer hidden states repeated 3 times
         return torch.cat([hidden_states_tuple[-1]] * 3, dim=-1)
     
     return torch.cat(aux_hidden, dim=-1)
@@ -430,8 +435,6 @@ def generate_speculative(
     
     Returns generated tokens and timing metrics.
     """
-    from specforge.utils import padding
-    
     metrics = TimingMetrics()
     device = input_ids.device
     
@@ -504,48 +507,44 @@ def generate_speculative(
         
         metrics.num_spec_steps += 1
         
-        # === DRAFT PHASE (TTT-style) ===
-        # Generate draft tokens using Eagle3's TTT loop pattern
-        # Key: use TARGET hidden states throughout, with padding for each position
+        # === DRAFT PHASE ===
+        # Simple autoregressive draft token generation
+        # Use target hidden states at last position to predict next tokens
         draft_tokens = []
         draft_logits_list = []
         
         with torch.no_grad():
-            # Project target hidden states (full sequence, not just last position)
-            projected_hidden = draft_model.project_hidden_states(target_hidden)
+            # Project target hidden states (last position only for next-token prediction)
+            # Get last position hidden states
+            last_hidden = target_hidden[:, -1:, :]  # [B, 1, hidden_size * 3]
+            projected_hidden = draft_model.project_hidden_states(last_hidden)
             
-            # Initialize for TTT loop
-            draft_input_ids = current_ids.clone()
-            draft_attn_mask = current_mask.clone()
-            seq_len = draft_input_ids.shape[1]
-            
-            # Position IDs for full sequence
-            position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
-            
-            # Hidden states for TTT loop (starts with projected target hidden states)
+            # Start from last generated token
+            draft_input = next_token
             hidden_states = projected_hidden
             
-            for ttt_idx in range(num_draft_tokens):
-                # Embed input ids
-                input_embeds = draft_model.embed_input_ids(draft_input_ids)
+            for draft_idx in range(num_draft_tokens):
+                # Embed input
+                input_embeds = draft_model.embed_input_ids(draft_input)
                 input_embeds = input_embeds.to(hidden_states.dtype)
                 
-                # Run draft backbone (matching eval_eagle.py pattern)
+                # Create attention mask for single token
+                attn_mask = torch.ones((1, 1), dtype=torch.long, device=device)
+                position_ids = torch.zeros((1, 1), dtype=torch.long, device=device)
+                
+                # Run draft backbone
                 hidden_states_out = draft_model.backbone(
                     input_embeds=input_embeds,
                     hidden_states=hidden_states,
                     cache_hidden=[[], []],
-                    attention_mask=draft_attn_mask,
+                    attention_mask=attn_mask,
                     position_ids=position_ids,
                     past_key_values=None,
                     use_cache=False,
                 )
                 
-                # Update hidden states for next iteration
-                hidden_states = hidden_states_out
-                
-                # Get logits and sample from last position
-                draft_logits = draft_model.compute_logits(hidden_states)
+                # Get logits
+                draft_logits = draft_model.compute_logits(hidden_states_out)
                 last_logits = draft_logits[:, -1, :]
                 draft_logits_list.append(last_logits)
                 
@@ -559,18 +558,10 @@ def generate_speculative(
                 
                 if draft_token.item() == tokenizer.eos_token_id:
                     break
-        
-                # Pad for next TTT iteration (matching training pattern)
-                # Must pad ALL sequence-length tensors to keep dimensions aligned
-                if ttt_idx < num_draft_tokens - 1:
-                    draft_input_ids = padding(draft_input_ids, left=False)
-                    position_ids = padding(position_ids, left=False)
-                    hidden_states = padding(hidden_states, left=False)
-                    # Pad attention mask (add 1 for new position)
-                    draft_attn_mask = torch.cat([
-                        draft_attn_mask, 
-                        torch.ones((1, 1), dtype=draft_attn_mask.dtype, device=device)
-                    ], dim=1)
+                
+                # For next iteration: use draft output hidden states and new token
+                hidden_states = hidden_states_out[:, -1:, :]
+                draft_input = draft_token
         
         if not draft_tokens:
             break
