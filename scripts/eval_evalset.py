@@ -210,13 +210,17 @@ def get_draft_predictions(eagle3_model, eagle3_data, ttt_length, attention_backe
     # Project hidden states
     hidden_states = draft_model.project_hidden_states(hidden_states)
 
-    # Initialize cache
+    # Initialize cache based on attention backend
     if attention_backend == "sdpa" or attention_backend == "flex_attention_mla":
         cache_hidden = [[], []]
         past_key_values = None
     elif attention_backend == "flex_attention":
         cache_hidden = None
         past_key_values = DynamicCache()
+    else:
+        # Default fallback - same as sdpa
+        cache_hidden = [[], []]
+        past_key_values = None
 
     # Store predictions for each TTT position
     all_predictions = []

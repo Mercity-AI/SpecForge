@@ -5,31 +5,36 @@ EAGLE3 Draft Model Evaluation Script
 Simple evaluation on a few prompts to check accuracy and speed.
 
 Usage:
-    # Basic usage (regular python)
+    # Basic usage with dataset file
     python scripts/eval_eagle.py \
         --draft-checkpoint ./outputs/qwen-8b-eagle3/epoch_0_step_2000 \
-        --target-model-path Qwen/Qwen2.5-7B-Instruct
+        --target-model-path Qwen/Qwen2.5-7B-Instruct \
+        --dataset-path ./cache/dataset/train.jsonl
 
     # For MLA models (DeepSeek-V2, etc.)
     python scripts/eval_eagle.py \
         --draft-checkpoint ./outputs/eagle3-mla/epoch_9_step_300 \
         --target-model-path deepseek-ai/DeepSeek-V2-Lite \
-        --attention-backend flex_attention_mla
+        --attention-backend flex_attention_mla \
+        --dataset-path ./cache/dataset/train.jsonl
 
     # With vocab mapping from cache directory
     python scripts/eval_eagle.py \
         --draft-checkpoint ./outputs/model/epoch_0_step_1000 \
         --target-model-path Qwen/Qwen2.5-7B-Instruct \
-        --vocab-mapping-path ./cache/vocab_mapping/abc123.pt
+        --vocab-mapping-path ./cache/vocab_mapping/abc123.pt \
+        --dataset-path ./cache/dataset/train.jsonl
 
     # Also supports torchrun (not required)
     torchrun --nproc_per_node=1 scripts/eval_eagle.py \
         --draft-checkpoint ./outputs/model/epoch_0_step_1000 \
         --target-model-path Qwen/Qwen2.5-7B-Instruct \
+        --dataset-path ./cache/dataset/train.jsonl \
         --num-samples 10
 """
 
 import argparse
+import json
 import os
 import re
 import time
@@ -49,35 +54,46 @@ from specforge.modeling.target import get_eagle3_target_model
 
 
 # ==============================================================================
-# Built-in Test Prompts
+# Dataset Loading
 # ==============================================================================
 
-TEST_PROMPTS = [
-    "What is the capital of France?",
-    "Explain quantum computing in simple terms.",
-    "Write a Python function to calculate factorial.",
-    "What are the benefits of regular exercise?",
-    "How does photosynthesis work?",
-    "What is machine learning?",
-    "Describe the water cycle.",
-    "What is the Pythagorean theorem?",
-    "How do computers store information?",
-    "What causes the seasons on Earth?",
-]
 
-# Corresponding simple responses for evaluation
-TEST_RESPONSES = [
-    "The capital of France is Paris. Paris is located in the north-central part of the country and is the largest city in France.",
-    "Quantum computing uses quantum bits or qubits that can exist in multiple states simultaneously, unlike classical bits that are either 0 or 1.",
-    "Here's a Python function to calculate factorial:\n\ndef factorial(n):\n    if n <= 1:\n        return 1\n    return n * factorial(n - 1)",
-    "Regular exercise improves cardiovascular health, strengthens muscles, boosts mood, helps maintain healthy weight, and increases energy levels.",
-    "Photosynthesis is the process by which plants convert sunlight, water, and carbon dioxide into glucose and oxygen using chlorophyll.",
-    "Machine learning is a subset of AI where computers learn patterns from data to make predictions or decisions without being explicitly programmed.",
-    "The water cycle involves evaporation from bodies of water, condensation into clouds, precipitation as rain or snow, and collection back into bodies of water.",
-    "The Pythagorean theorem states that in a right triangle, the square of the hypotenuse equals the sum of squares of the other two sides: a² + b² = c².",
-    "Computers store information using binary code (0s and 1s) in memory cells. Data is stored in RAM temporarily and on hard drives permanently.",
-    "Seasons are caused by Earth's tilted axis (23.5 degrees) as it orbits the Sun, causing different hemispheres to receive varying amounts of sunlight.",
-]
+def load_dataset_samples(dataset_path: str, num_samples: int) -> List[Dict]:
+    """Load samples from JSONL dataset file.
+
+    Expected format (from collect_data.py):
+    {"id": "...", "conversations": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]}
+    """
+    samples = []
+    with open(dataset_path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i >= num_samples:
+                break
+            data = json.loads(line.strip())
+            samples.append(data)
+    return samples
+
+
+def extract_conversation(sample: Dict) -> Tuple[List[Dict], str]:
+    """Extract messages and the last assistant response from a sample.
+
+    Returns:
+        messages: List of conversation messages (including assistant)
+        last_assistant_content: The content of the last assistant message
+    """
+    conversations = sample.get("conversations", [])
+    messages = []
+    last_assistant_content = ""
+
+    for msg in conversations:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role in ["user", "assistant", "system"] and content:
+            messages.append({"role": role, "content": content})
+            if role == "assistant":
+                last_assistant_content = content
+
+    return messages, last_assistant_content
 
 
 # ==============================================================================
@@ -101,10 +117,16 @@ def parse_args() -> argparse.Namespace:
         help="HuggingFace model ID or local path to target model",
     )
     parser.add_argument(
+        "--dataset-path",
+        type=str,
+        required=True,
+        help="Path to JSONL dataset file (e.g., train.jsonl from collect_data.py)",
+    )
+    parser.add_argument(
         "--num-samples",
         type=int,
         default=5,
-        help="Number of prompts to evaluate (default: 5, max: 10)",
+        help="Number of prompts to evaluate (default: 5)",
     )
     parser.add_argument(
         "--chat-template",
@@ -261,7 +283,16 @@ def get_draft_predictions(eagle3_model, eagle3_data, ttt_length, attention_backe
 
 def main():
     args = parse_args()
-    num_samples = min(args.num_samples, len(TEST_PROMPTS))
+
+    # Load dataset
+    if not os.path.exists(args.dataset_path):
+        raise FileNotFoundError(f"Dataset not found: {args.dataset_path}")
+
+    dataset_samples = load_dataset_samples(args.dataset_path, args.num_samples)
+    num_samples = len(dataset_samples)
+
+    if num_samples == 0:
+        raise ValueError(f"No samples loaded from {args.dataset_path}")
 
     # Initialize distributed if running with torchrun
     if 'RANK' in os.environ or 'LOCAL_RANK' in os.environ:
@@ -378,14 +409,19 @@ def main():
     total_time = 0.0
 
     for i in range(num_samples):
-        prompt = TEST_PROMPTS[i]
-        response = TEST_RESPONSES[i]
+        sample = dataset_samples[i]
+        messages, response = extract_conversation(sample)
 
-        # Build conversation
-        messages = [{"role": "user", "content": prompt}]
-        if template.system_prompt:
+        if len(messages) < 2:
+            print(f"  [{i+1}/{num_samples}] Skipping sample with insufficient messages")
+            continue
+
+        # Get first user message for display
+        prompt = next((m["content"] for m in messages if m["role"] == "user"), "")
+
+        # Add system prompt if template has one and sample doesn't
+        if template.system_prompt and not any(m["role"] == "system" for m in messages):
             messages = [{"role": "system", "content": template.system_prompt}] + messages
-        messages.append({"role": "assistant", "content": response})
 
         # Tokenize (matching training behavior)
         try:
