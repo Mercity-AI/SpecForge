@@ -52,7 +52,6 @@ from specforge.data.template import TEMPLATE_REGISTRY
 from specforge.distributed import init_distributed
 from specforge.modeling.target import get_eagle3_target_model
 
-
 # ==============================================================================
 # Dataset Loading
 # ==============================================================================
@@ -373,17 +372,6 @@ def main():
         )
     else:
         target_model.set_aux_hidden_states_layers()
-
-    # Estimate target params
-    target_config = AutoConfig.from_pretrained(args.target_model_path)
-    target_params = getattr(target_config, "num_parameters", None)
-    if target_params is None:
-        h = target_config.hidden_size
-        n_layers = target_config.num_hidden_layers
-        vocab = target_config.vocab_size
-        inter = getattr(target_config, "intermediate_size", h * 4)
-        target_params = vocab * h * 2 + n_layers * (h * h * 4 + h * inter * 3)
-    print(f"   Parameters: ~{fmt_params(target_params)} (estimated)")
 
     # Load tokenizer
     print(f"\n📝 Loading tokenizer...")
