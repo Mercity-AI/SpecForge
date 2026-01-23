@@ -388,6 +388,90 @@ def save_checkpoints(
         dist.barrier()
 
 
+def get_draft_predictions_for_logging(draft_model, eagle3_data, args):
+    """Get draft model predictions for logging (simplified from eval scripts)"""
+    from transformers.cache_utils import DynamicCache
+    from specforge.utils import padding
+    
+    input_ids = eagle3_data.input_ids
+    attention_mask = eagle3_data.attention_mask
+    hidden_states = eagle3_data.hidden_states
+    target = eagle3_data.target
+    loss_mask = eagle3_data.loss_mask
+    
+    batch_size, seq_length = input_ids.shape
+    device = hidden_states.device
+    
+    # Project hidden states
+    hidden_states = draft_model.project_hidden_states(hidden_states)
+    
+    # Initialize cache based on attention backend
+    if args.attention_backend == "sdpa" or args.attention_backend == "flex_attention_mla":
+        cache_hidden = [[], []]
+        past_key_values = None
+    elif args.attention_backend == "flex_attention":
+        cache_hidden = None
+        past_key_values = DynamicCache()
+    else:
+        cache_hidden = None
+        past_key_values = None
+    
+    # Store predictions and logits for each TTT position
+    all_predictions = []
+    all_logits = []
+    
+    # Initialize position_ids
+    past_key_values_length = 0
+    position_ids = torch.arange(
+        past_key_values_length,
+        seq_length + past_key_values_length,
+        dtype=torch.long,
+        device=device,
+    )
+    position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+    
+    for idx in range(args.ttt_length):
+        # Embed input ids
+        inputs_embeds = draft_model.embed_input_ids(input_ids)
+        inputs_embeds = inputs_embeds.to(hidden_states.dtype)
+        
+        # Run backbone
+        hidden_states_out = draft_model.backbone(
+            input_embeds=inputs_embeds,
+            hidden_states=hidden_states,
+            cache_hidden=cache_hidden,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        
+        hidden_states = hidden_states_out
+        
+        # Get logits and predictions
+        logits = draft_model.compute_logits(hidden_states)
+        predictions = logits.argmax(dim=-1)  # [batch, seq_len]
+        all_predictions.append(predictions)
+        all_logits.append(logits)
+        
+        # Pad for next iteration (except last)
+        if idx < args.ttt_length - 1:
+            input_ids = padding(input_ids, left=False)
+            position_ids = padding(position_ids, left=False)
+    
+    # Stack into tensors
+    all_predictions = torch.stack(all_predictions, dim=1)  # [batch, ttt_length, seq_len]
+    all_logits = torch.stack(all_logits, dim=1)  # [batch, ttt_length, seq_len, vocab]
+    
+    return {
+        'input_ids': eagle3_data.input_ids,
+        'loss_mask': loss_mask,
+        'draft_logits': all_logits,
+        'draft_predictions': all_predictions,
+        'targets': target,
+    }
+
+
 def log_detailed_predictions(
     args: Namespace,
     eagle3_model: nn.Module,
@@ -398,16 +482,20 @@ def log_detailed_predictions(
     epoch: int,
     is_online: bool = True,
 ) -> None:
-    """Log detailed predictions to understand drafter improvement"""
-    # Get predictions with detailed outputs
+    """Log detailed predictions by running draft model and decoding outputs"""
+    
+    if dist.get_rank() != 0:
+        return
+    
+    if args.is_vlm:
+        print_on_rank0("Detailed logging not yet supported for VLM")
+        return
+    
     eagle3_model.eval()
     draft_model = eagle3_model.draft_model if hasattr(eagle3_model, 'draft_model') else eagle3_model.module.draft_model
     
     with torch.no_grad():
-        if args.is_vlm:
-            # For VLM, we'll skip detailed logging for now
-            return
-        
+        # Get eagle3 data from target model
         if is_online:
             eagle3_data = target_model.generate_eagle3_data(
                 input_ids=data["input_ids"].cuda(),
@@ -420,215 +508,114 @@ def log_detailed_predictions(
             loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
             target = get_dp_data_shard_from_tp(eagle3_data.target)
             hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+            
+            # Reconstruct eagle3_data with sharded tensors
+            from types import SimpleNamespace
+            eagle3_data = SimpleNamespace(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                loss_mask=loss_mask,
+                target=target,
+                hidden_states=hidden_states,
+            )
         else:
-            input_ids = data["input_ids"].cuda()
-            attention_mask = data["attention_mask"].cuda()
-            loss_mask = data["loss_mask"].cuda()
-            hidden_states = data["hidden_state"].cuda()
-            target = target_model(data["target"].cuda())
-            input_ids, target, loss_mask = target_model.preprocess(
-                input_ids, target, loss_mask
-            )
+            print_on_rank0("Detailed logging only supported for online training")
+            eagle3_model.train()
+            return
         
-        # Get draft model predictions using the correct API
-        batch_size, seq_length, _ = hidden_states.shape
+        # Get predictions from draft model
+        pred_data = get_draft_predictions_for_logging(draft_model, eagle3_data, args)
         
-        # Project hidden states
-        projected_hidden_states = draft_model.project_hidden_states(hidden_states)
+    print_on_rank0(f"\n{'='*80}")
+    print_on_rank0(f"Epoch {epoch} - Step {global_step} - Detailed Predictions")
+    print_on_rank0(f"{'='*80}")
+    
+    # Decode and print predictions
+    input_ids = pred_data['input_ids']
+    loss_mask = pred_data['loss_mask']
+    draft_logits = pred_data['draft_logits']
+    draft_predictions = pred_data['draft_predictions']
+    target_tokens = pred_data['targets']
+    
+    draft_probs = torch.softmax(draft_logits, dim=-1)
+    
+    # Log a few samples
+    num_samples = min(args.num_samples_to_log, input_ids.shape[0])
+    
+    for sample_idx in range(num_samples):
+        sample_input_ids = input_ids[sample_idx]
+        sample_loss_mask = loss_mask[sample_idx]
+        sample_draft_preds = draft_predictions[sample_idx]
+        sample_draft_probs = draft_probs[sample_idx]
         
-        # Prepare position IDs
-        device = hidden_states.device
-        position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
-        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+        # Handle different target shapes
+        if target_tokens.dim() == 3:
+            sample_targets = target_tokens[sample_idx]  # [ttt_length, seq_len]
+        else:
+            sample_targets = target_tokens[sample_idx].unsqueeze(0).expand(args.ttt_length, -1)
         
-        # Prepare attention mask
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=device)
-        decoder_attention_mask = draft_model.prepare_decoder_attention_mask(
-            attention_mask, projected_hidden_states, batch_size, seq_length, 0
-        )
+        # Find valid positions (where we compute loss)
+        valid_positions = sample_loss_mask.nonzero(as_tuple=True)[0]
+        if len(valid_positions) == 0:
+            print_on_rank0(f"\n[Sample {sample_idx}] No valid tokens (empty loss mask)")
+            continue
         
-        # Run multiple TTT steps to get predictions
-        draft_logits_list = []
-        hidden_states_step = projected_hidden_states
-        cache_hidden = [[], []] if args.ttt_length > 1 else None
+        # Decode context (input)
+        start_pos = max(0, valid_positions[0].item() - 20)
+        end_pos = min(len(sample_input_ids), valid_positions[-1].item() + 5)
+        context_tokens = sample_input_ids[start_pos:end_pos]
+        context_text = tokenizer.decode(context_tokens, skip_special_tokens=False)
         
-        for ttt_idx in range(args.ttt_length):
-            # Embed input IDs
-            inputs_embeds = draft_model.embed_input_ids(input_ids)
-            inputs_embeds = inputs_embeds.to(hidden_states_step.dtype)
+        print_on_rank0(f"\n{'─'*80}")
+        print_on_rank0(f"[Sample {sample_idx}]")
+        print_on_rank0(f"Context: {context_text[:150]}...")
+        print_on_rank0(f"Valid prediction positions: {len(valid_positions)}")
+        
+        # Show predictions for each TTT position
+        for ttt_idx in range(min(args.ttt_length, sample_draft_preds.shape[0])):
+            preds_at_pos = sample_draft_preds[ttt_idx]
+            targets_at_pos = sample_targets[ttt_idx]
+            probs_at_pos = sample_draft_probs[ttt_idx]
             
-            # Run backbone (use_cache=False for logging since we don't need KV cache)
-            hidden_states_out = draft_model.backbone(
-                input_embeds=inputs_embeds,
-                hidden_states=hidden_states_step,
-                cache_hidden=cache_hidden,
-                attention_mask=decoder_attention_mask,
-                position_ids=position_ids,
-                past_key_values=None,
-                use_cache=False,
-            )
-            
-            # Compute logits
-            logits = draft_model.compute_logits(hidden_states_out)
-            draft_logits_list.append(logits)
-            
-            # Update hidden states for next iteration
-            hidden_states_step = hidden_states_out
-        
-        # Stack logits: [ttt_length, batch, seq_len, vocab_size] -> [batch, ttt_length, seq_len, vocab_size]
-        draft_logits = torch.stack(draft_logits_list, dim=1)
-        draft_probs = torch.softmax(draft_logits, dim=-1)  # Convert to probabilities
-        draft_predictions = torch.argmax(draft_logits, dim=-1)  # [batch, ttt_length, seq_len]
-        
-        # Prepare logging data
-        num_samples = min(args.num_samples_to_log, input_ids.shape[0])
-        log_data = []
-        
-        for sample_idx in range(num_samples):
-            sample_input_ids = input_ids[sample_idx]
-            sample_loss_mask = loss_mask[sample_idx]
-            sample_target = target[sample_idx]
-            sample_draft_preds = draft_predictions[sample_idx]
-            
-            # Find non-padded positions
-            valid_positions = sample_loss_mask.nonzero(as_tuple=True)[0]
-            if len(valid_positions) == 0:
+            # Get valid positions for this TTT step
+            valid_for_ttt = valid_positions[valid_positions < len(preds_at_pos)]
+            if len(valid_for_ttt) == 0:
                 continue
             
-            # Get a window of tokens to log (not the entire sequence)
-            start_pos = max(0, valid_positions[0].item() - 10)
-            end_pos = min(len(sample_input_ids), valid_positions[-1].item() + 10)
+            # Take first N tokens to show
+            show_positions = valid_for_ttt[:min(15, len(valid_for_ttt))]
             
-            # Decode input context
-            context_tokens = sample_input_ids[start_pos:end_pos]
-            context_text = tokenizer.decode(context_tokens, skip_special_tokens=False)
+            pred_tokens_show = preds_at_pos[show_positions]
+            target_tokens_show = targets_at_pos[show_positions]
             
-            # Log predictions for each draft position
-            position_logs = []
-            for ttt_idx in range(min(args.ttt_length, draft_predictions.shape[1])):
-                # Get predictions at this TTT position
-                ttt_preds = sample_draft_preds[ttt_idx]
-                ttt_targets = sample_target[ttt_idx] if target.dim() > 2 else sample_target
-                ttt_probs = draft_probs[sample_idx, ttt_idx]  # Probabilities for this position
-                
-                # Find valid prediction positions
-                valid_pred_positions = valid_positions[valid_positions < len(ttt_preds)]
-                if len(valid_pred_positions) == 0:
-                    continue
-                
-                # Take a few positions to log
-                positions_to_show = valid_pred_positions[:min(20, len(valid_pred_positions))]
-                
-                pred_tokens = ttt_preds[positions_to_show]
-                target_tokens = ttt_targets[positions_to_show]
-                
-                # Get confidence scores
-                pred_confidences = []
-                target_confidences = []
-                for pos_idx, pos in enumerate(positions_to_show):
-                    pred_token = pred_tokens[pos_idx].item()
-                    target_token = target_tokens[pos_idx].item()
-                    
-                    # Get probability of predicted token
-                    pred_conf = ttt_probs[pos, pred_token].item()
-                    pred_confidences.append(pred_conf)
-                    
-                    # Get probability assigned to target token
-                    target_conf = ttt_probs[pos, target_token].item()
-                    target_confidences.append(target_conf)
-                
-                avg_pred_conf = sum(pred_confidences) / len(pred_confidences) if pred_confidences else 0
-                avg_target_conf = sum(target_confidences) / len(target_confidences) if target_confidences else 0
-                
-                # Calculate accuracy
-                correct = (pred_tokens == target_tokens).sum().item()
-                total = len(positions_to_show)
-                accuracy = correct / total if total > 0 else 0
-                
-                # Decode predictions and targets
-                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=False)
-                target_text = tokenizer.decode(target_tokens, skip_special_tokens=False)
-                
-                position_logs.append({
-                    'position': ttt_idx,
-                    'accuracy': f"{accuracy:.2%}",
-                    'predicted': pred_text,
-                    'target': target_text,
-                    'match': '✓' if pred_text == target_text else '✗',
-                    'pred_confidence': f"{avg_pred_conf:.3f}",
-                    'target_confidence': f"{avg_target_conf:.3f}"
-                })
+            # Calculate accuracy
+            matches = (pred_tokens_show == target_tokens_show).sum().item()
+            accuracy = matches / len(show_positions) if len(show_positions) > 0 else 0
             
-            log_data.append({
-                'sample': sample_idx,
-                'context': context_text[:200] + '...' if len(context_text) > 200 else context_text,
-                'predictions': position_logs
-            })
-        
-        # Print detailed predictions
-        if dist.get_rank() == 0:
-            # Print model internals
-            print_on_rank0(f"\n{'='*80}")
-            print_on_rank0(f"Epoch {epoch} - Step {global_step} - Detailed Predictions")
-            print_on_rank0(f"{'='*80}")
-            print_on_rank0(f"\n[Model Internals]")
-            print_on_rank0(f"  Input shape: {input_ids.shape}")
-            print_on_rank0(f"  Hidden states shape: {hidden_states.shape}")
-            print_on_rank0(f"  Target shape: {target.shape}")
-            print_on_rank0(f"  Loss mask sum: {loss_mask.sum().item()}")
-            print_on_rank0(f"  Draft predictions shape: {draft_predictions.shape}")
+            # Decode the tokens
+            pred_text = tokenizer.decode(pred_tokens_show, skip_special_tokens=False)
+            target_text = tokenizer.decode(target_tokens_show, skip_special_tokens=False)
             
-            # Collect confidence data for summary
-            confidence_data = []
-            for sample in log_data:
-                for pred_log in sample['predictions']:
-                    confidence_data.append({
-                        'position': pred_log['position'],
-                        'pred_conf': float(pred_log['pred_confidence']),
-                        'target_conf': float(pred_log['target_confidence'])
-                    })
+            # Get average confidence
+            pred_confidences = [probs_at_pos[pos, pred_tokens_show[i]].item() 
+                              for i, pos in enumerate(show_positions)]
+            target_confidences = [probs_at_pos[pos, target_tokens_show[i]].item() 
+                                for i, pos in enumerate(show_positions)]
+            avg_pred_conf = sum(pred_confidences) / len(pred_confidences) if pred_confidences else 0
+            avg_target_conf = sum(target_confidences) / len(target_confidences) if target_confidences else 0
             
-            # Print detailed predictions
-            print_on_rank0(f"\n[Predictions]")
-            for sample in log_data:
-                print_on_rank0(f"\n[Sample {sample['sample']}]")
-                print_on_rank0(f"Context: {sample['context'][:200]}...")
-                for pred_log in sample['predictions']:
-                    print_on_rank0(f"\n  Position {pred_log['position']} (Acc: {pred_log['accuracy']}) {pred_log['match']}")
-                    print_on_rank0(f"    Predicted: {pred_log['predicted'][:80]} (conf: {pred_log['pred_confidence']})")
-                    print_on_rank0(f"    Target:    {pred_log['target'][:80]} (conf: {pred_log['target_confidence']})")
-                    
-                    # Highlight if model is confident but wrong, or uncertain but right
-                    pred_conf_val = float(pred_log['pred_confidence'])
-                    target_conf_val = float(pred_log['target_confidence'])
-                    if pred_log['match'] == '✗' and pred_conf_val > 0.7:
-                        print_on_rank0(f"    ⚠️  High confidence in wrong prediction!")
-                    elif pred_log['match'] == '✓' and target_conf_val < 0.3:
-                        print_on_rank0(f"    ⚠️  Low confidence in correct prediction")
+            match_symbol = "✓" if pred_text == target_text else "✗"
             
-            # Print confidence summary
-            if confidence_data:
-                overall_pred_conf = sum(c['pred_conf'] for c in confidence_data) / len(confidence_data)
-                overall_target_conf = sum(c['target_conf'] for c in confidence_data) / len(confidence_data)
-                
-                print_on_rank0(f"\n[Confidence Summary]")
-                print_on_rank0(f"  Avg confidence in predictions: {overall_pred_conf:.3f}")
-                print_on_rank0(f"  Avg confidence in targets: {overall_target_conf:.3f}")
-                print_on_rank0(f"  Gap (target - pred): {overall_target_conf - overall_pred_conf:.3f}")
-                print_on_rank0(f"  → {'Model improving!' if overall_target_conf > overall_pred_conf else 'Model needs more training'}")
-                
-                # Per-position confidence
-                print_on_rank0(f"\n[Per-Position Confidence]")
-                for pos in range(args.ttt_length):
-                    pos_confs = [c for c in confidence_data if c['position'] == pos]
-                    if pos_confs:
-                        avg_pred_conf = sum(c['pred_conf'] for c in pos_confs) / len(pos_confs)
-                        avg_target_conf = sum(c['target_conf'] for c in pos_confs) / len(pos_confs)
-                        print_on_rank0(f"  Position {pos}: pred={avg_pred_conf:.3f}, target={avg_target_conf:.3f}")
+            print_on_rank0(f"\n  Position {ttt_idx} | Accuracy: {accuracy:.1%} {match_symbol}")
+            print_on_rank0(f"    Predicted: {pred_text[:100]}")
+            print_on_rank0(f"               (confidence: {avg_pred_conf:.3f})")
+            print_on_rank0(f"    Target:    {target_text[:100]}")
+            print_on_rank0(f"               (confidence: {avg_target_conf:.3f})")
             
-            print_on_rank0(f"\n{'='*80}\n")
+            if match_symbol == "✗" and avg_pred_conf > 0.7:
+                print_on_rank0(f"    ⚠️  High confidence but WRONG!")
     
+    print_on_rank0(f"\n{'='*80}\n")
     eagle3_model.train()
 
 
