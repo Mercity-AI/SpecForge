@@ -4,33 +4,17 @@ EAGLE3 Draft Model Evaluation Script
 
 Simple evaluation on a few prompts to check accuracy and speed.
 
-Usage:
-    # Basic usage with dataset file
-    python scripts/eval_eagle.py \
-        --draft-checkpoint ./outputs/qwen-8b-eagle3/epoch_0_step_2000 \
-        --target-model-path Qwen/Qwen2.5-7B-Instruct \
-        --dataset-path ./cache/dataset/train.jsonl
-
-    # For MLA models (DeepSeek-V2, etc.)
-    python scripts/eval_eagle.py \
-        --draft-checkpoint ./outputs/eagle3-mla/epoch_9_step_300 \
-        --target-model-path deepseek-ai/DeepSeek-V2-Lite \
-        --attention-backend flex_attention_mla \
-        --dataset-path ./cache/dataset/train.jsonl
-
-    # With vocab mapping from cache directory
-    python scripts/eval_eagle.py \
-        --draft-checkpoint ./outputs/model/epoch_0_step_1000 \
-        --target-model-path Qwen/Qwen2.5-7B-Instruct \
-        --vocab-mapping-path ./cache/vocab_mapping/abc123.pt \
-        --dataset-path ./cache/dataset/train.jsonl
-
-    # Also supports torchrun (not required)
-    torchrun --nproc_per_node=1 scripts/eval_eagle.py \
-        --draft-checkpoint ./outputs/model/epoch_0_step_1000 \
-        --target-model-path Qwen/Qwen2.5-7B-Instruct \
-        --dataset-path ./cache/dataset/train.jsonl \
-        --num-samples 10
+Usage: 
+python scripts/eval_eagle.py 
+    --draft-checkpoint ./outputs/epoch_1_step_12528 
+    --target-model-path Qwen/Qwen2.5-7B-Instruct 
+    --dataset-path ./cache/dataset/train.jsonl 
+    --num-samples 10 
+    --ttt-length 4 
+    --max-length 1024 
+    --chat-template qwen 
+    --attention-backend flex_attention_mla 
+    --verbose
 """
 
 import argparse
@@ -55,8 +39,6 @@ from specforge.modeling.target import get_eagle3_target_model
 # ==============================================================================
 # Dataset Loading
 # ==============================================================================
-
-
 def load_dataset_samples(dataset_path: str, num_samples: int) -> List[Dict]:
     """Load samples from JSONL dataset file.
 
@@ -517,8 +499,8 @@ def main():
         mean_acc = sum(a.item() for a in acces) / len(acces)
         
         if args.verbose:
-            # Show detailed predictions for first N positions
-            print(f"\n📊 Detailed Predictions (showing first {args.show_first_n_positions} positions):")
+            # Show detailed predictions for assistant tokens only
+            print(f"\n📊 Detailed Predictions (ASSISTANT TOKENS ONLY - showing first {args.show_first_n_positions} positions):")
             print(f"\nLegend: TTT=Time-to-Target offset (0 means predicting next token, 1 means +1 position ahead, etc.)")
             print(f"\n{'Pos':<4} {'TTT':<3} {'Context (last 3 tokens)':<50} {'Draft':<20} {'Target':<20} {'✓/✗':<3}")
             print("-" * 120)
@@ -526,53 +508,85 @@ def main():
             # Get target tokens (ground truth from target model logits)
             target_tokens = eagle3_data.target.argmax(dim=-1)[0]  # [seq_len]
             input_tokens = input_ids[0].tolist()  # [seq_len]
+            loss_mask_flat = loss_mask[0]  # [seq_len]
             
-            # Show predictions for each position
-            num_positions_to_show = min(args.show_first_n_positions, input_ids.shape[1] - args.ttt_length)
+            # Get assistant token positions (where loss_mask == 1)
+            assistant_positions = [i for i in range(len(loss_mask_flat)) if loss_mask_flat[i] == 1]
             
-            for pos_idx in range(num_positions_to_show):
-                # Show context (last 3 tokens before prediction point)
-                context_start = max(0, pos_idx - 2)
-                context_tokens = input_tokens[context_start:pos_idx+1]
-                context_text = tokenizer.decode(context_tokens, skip_special_tokens=False)
-                context_text = repr(context_text)[1:-1]  # Escape special chars
-                context_text = ("..." + context_text[-47:]) if len(context_text) > 50 else context_text
+            if len(assistant_positions) == 0:
+                print("⚠️  No assistant tokens found in loss mask!")
+            else:
+                print(f"Evaluating {len(assistant_positions)} assistant token positions out of {len(loss_mask_flat)} total tokens\n")
                 
-                # For each TTT position (0 to ttt_length-1)
-                for ttt_idx in range(args.ttt_length):
-                    # Draft model predicts token at position pos_idx + ttt_idx
-                    target_pos = pos_idx + ttt_idx
-                    
-                    if target_pos >= len(target_tokens):
-                        break
-                    
-                    # Get draft prediction
-                    draft_pred = draft_predictions[ttt_idx][0, pos_idx].item()
-                    target_token = target_tokens[target_pos].item()
-                    
-                    match = "✓" if draft_pred == target_token else "✗"
-                    
-                    # Decode tokens
-                    draft_text = tokenizer.decode([draft_pred], skip_special_tokens=False)
-                    target_text = tokenizer.decode([target_token], skip_special_tokens=False)
-                    
-                    # Escape special characters for display
-                    draft_text = repr(draft_text)[1:-1]  # Remove outer quotes from repr
-                    target_text = repr(target_text)[1:-1]
-                    
-                    # Truncate long tokens
-                    draft_text = (draft_text[:17] + "...") if len(draft_text) > 20 else draft_text
-                    target_text = (target_text[:17] + "...") if len(target_text) > 20 else target_text
-                    
-                    # Only show context for first TTT position
-                    if ttt_idx == 0:
-                        print(f"{pos_idx:<4} {ttt_idx:<3} {context_text:<50} {draft_text:<20} {target_text:<20} {match:<3}")
-                    else:
-                        print(f"{'':4} {ttt_idx:<3} {'':50} {draft_text:<20} {target_text:<20} {match:<3}")
+                # Calculate accuracy for the window we're about to show
+                num_positions_to_show = min(args.show_first_n_positions, len(assistant_positions))
+                window_correct = [0] * args.ttt_length
+                window_total = [0] * args.ttt_length
                 
-                # Add separator between positions
-                if pos_idx < num_positions_to_show - 1 and pos_idx % 5 == 4:
-                    print()
+                for pos_idx in assistant_positions[:num_positions_to_show]:
+                    for ttt_idx in range(args.ttt_length):
+                        target_pos = pos_idx + ttt_idx
+                        if target_pos < len(target_tokens):
+                            draft_pred = draft_predictions[ttt_idx][0, pos_idx].item()
+                            target_token = target_tokens[target_pos].item()
+                            if draft_pred == target_token:
+                                window_correct[ttt_idx] += 1
+                            window_total[ttt_idx] += 1
+                
+                window_accs = [window_correct[i] / window_total[i] if window_total[i] > 0 else 0 
+                              for i in range(args.ttt_length)]
+                window_mean_acc = sum(window_accs) / len(window_accs)
+                
+                print(f"⚠️  Window Accuracy (positions {assistant_positions[0]}-{assistant_positions[num_positions_to_show-1]}): {window_mean_acc:.1%}")
+                print(f"    Overall Accuracy (all {len(assistant_positions)} assistant positions): {mean_acc:.1%}")
+                print(f"    {'='*80}")
+                
+                positions_shown = 0
+                
+                for pos_idx in assistant_positions[:num_positions_to_show]:
+                    # Show context (last 3 tokens before prediction point)
+                    context_start = max(0, pos_idx - 2)
+                    context_tokens = input_tokens[context_start:pos_idx+1]
+                    context_text = tokenizer.decode(context_tokens, skip_special_tokens=False)
+                    context_text = repr(context_text)[1:-1]  # Escape special chars
+                    context_text = ("..." + context_text[-47:]) if len(context_text) > 50 else context_text
+                    
+                    # For each TTT position (0 to ttt_length-1)
+                    for ttt_idx in range(args.ttt_length):
+                        # Draft model predicts token at position pos_idx + ttt_idx
+                        target_pos = pos_idx + ttt_idx
+                        
+                        if target_pos >= len(target_tokens):
+                            break
+                        
+                        # Get draft prediction
+                        draft_pred = draft_predictions[ttt_idx][0, pos_idx].item()
+                        target_token = target_tokens[target_pos].item()
+                        
+                        match = "✓" if draft_pred == target_token else "✗"
+                        
+                        # Decode tokens
+                        draft_text = tokenizer.decode([draft_pred], skip_special_tokens=False)
+                        target_text = tokenizer.decode([target_token], skip_special_tokens=False)
+                        
+                        # Escape special characters for display
+                        draft_text = repr(draft_text)[1:-1]  # Remove outer quotes from repr
+                        target_text = repr(target_text)[1:-1]
+                        
+                        # Truncate long tokens
+                        draft_text = (draft_text[:17] + "...") if len(draft_text) > 20 else draft_text
+                        target_text = (target_text[:17] + "...") if len(target_text) > 20 else target_text
+                        
+                        # Only show context for first TTT position
+                        if ttt_idx == 0:
+                            print(f"{pos_idx:<4} {ttt_idx:<3} {context_text:<50} {draft_text:<20} {target_text:<20} {match:<3}")
+                        else:
+                            print(f"{'':4} {ttt_idx:<3} {'':50} {draft_text:<20} {target_text:<20} {match:<3}")
+                    
+                    positions_shown += 1
+                    # Add separator between positions
+                    if positions_shown < num_positions_to_show and positions_shown % 5 == 0:
+                        print()
             
             print(f"\n{'='*80}")
             print(f"Per-TTT Position Accuracy:")
@@ -591,16 +605,16 @@ def main():
 
     # Print results
     print("\n" + "=" * 60)
-    print("RESULTS")
+    print("RESULTS (ASSISTANT TOKENS ONLY)")
     print("=" * 60)
 
-    print("\n📊 Per-Position Accuracy:")
+    print("\n📊 Per-Position Accuracy (on assistant tokens):")
     for i, (acc, loss) in enumerate(zip(per_pos_acc, per_pos_loss)):
         bar = "█" * int(acc * 20) + "░" * (20 - int(acc * 20))
         print(f"   Position {i}: {bar} {acc:.1%}  (loss: {loss:.4f})")
 
     print("\n📈 Summary:")
-    print(f"   Mean Accuracy:    {mean_acc:.1%}")
+    print(f"   Mean Accuracy:    {mean_acc:.1%} (assistant tokens only)")
     print(f"   Mean Loss:        {mean_loss:.4f}")
     print(f"   Total Time:       {total_time:.2f}s")
     print(f"   Tokens Processed: {total_tokens:,}")
