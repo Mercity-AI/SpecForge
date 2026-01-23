@@ -180,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         default=20,
         help="Number of positions to show in verbose mode (default: 20)",
     )
+    parser.add_argument(
+        "--embedding-key",
+        type=str,
+        default="model.embed_tokens.weight",
+        help="Key for embeddings in target model checkpoint (default: model.embed_tokens.weight)",
+    )
 
     return parser.parse_args()
 
@@ -321,6 +327,11 @@ def main():
 
     draft_params = count_params(draft_model)
     print(f"   Parameters: {fmt_params(draft_params)}")
+
+    # Load embeddings from target model (checkpoint omits them)
+    print(f"   Loading embeddings from target model: {args.target_model_path}")
+    draft_model.load_embedding(args.target_model_path, embedding_key=args.embedding_key)
+    print(f"   Embeddings loaded successfully")
 
     # Load vocab mapping - check multiple locations
     vocab_mapping_path = None
