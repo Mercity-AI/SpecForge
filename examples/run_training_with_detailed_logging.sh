@@ -8,17 +8,17 @@ TRAIN_DATA="./cache/dataset/ultrachat_train.jsonl"
 OUTPUT_DIR="./outputs/eagle3_detailed_logging"
 
 # Run training with detailed logging enabled
-python scripts/train_eagle3.py \
+torchrun nproc_per_node=1 scripts/train_eagle3.py \
   --target-model-path $TARGET_MODEL \
   --train-data-path $TRAIN_DATA \
   --output-dir $OUTPUT_DIR \
   --batch-size 1 \
-  --max-length 512 \
-  --num-epochs 3 \
+  --max-length 1024 \
+  --num-epochs 10 \
   --learning-rate 1e-4 \
   --ttt-length 7 \
   --log-interval 50 \
-  --log-samples-interval 200 \
+  --log-samples-interval 100 \
   --num-samples-to-log 5 \
   --save-interval 1000 \
   --eval-interval 500 \
