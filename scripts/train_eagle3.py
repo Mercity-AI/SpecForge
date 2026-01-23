@@ -434,15 +434,54 @@ def log_detailed_predictions(
                 input_ids, target, loss_mask
             )
         
-        # Get draft model predictions
-        draft_outputs = draft_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            hidden_states=hidden_states,
+        # Get draft model predictions using the correct API
+        batch_size, seq_length, _ = hidden_states.shape
+        
+        # Project hidden states
+        projected_hidden_states = draft_model.project_hidden_states(hidden_states)
+        
+        # Prepare position IDs
+        device = hidden_states.device
+        position_ids = torch.arange(0, seq_length, dtype=torch.long, device=device)
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+        
+        # Prepare attention mask
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=device)
+        decoder_attention_mask = draft_model.prepare_decoder_attention_mask(
+            attention_mask, projected_hidden_states, batch_size, seq_length, 0
         )
         
-        # Get predictions for each position
-        draft_logits = draft_outputs.logits  # Shape: [batch, ttt_length, seq_len, vocab_size]
+        # Run multiple TTT steps to get predictions
+        draft_logits_list = []
+        hidden_states_step = projected_hidden_states
+        cache_hidden = [[], []] if args.ttt_length > 1 else None
+        
+        for ttt_idx in range(args.ttt_length):
+            # Embed input IDs
+            inputs_embeds = draft_model.embed_input_ids(input_ids)
+            inputs_embeds = inputs_embeds.to(hidden_states_step.dtype)
+            
+            # Run backbone
+            hidden_states_out = draft_model.backbone(
+                input_embeds=inputs_embeds,
+                hidden_states=hidden_states_step,
+                cache_hidden=cache_hidden,
+                attention_mask=decoder_attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=True,
+            )
+            
+            # Compute logits
+            logits = draft_model.compute_logits(hidden_states_out)
+            draft_logits_list.append(logits)
+            
+            # Update hidden states for next iteration
+            hidden_states_step = hidden_states_out
+        
+        # Stack logits: [ttt_length, batch, seq_len, vocab_size] -> [batch, ttt_length, seq_len, vocab_size]
+        draft_logits = torch.stack(draft_logits_list, dim=1)
         draft_probs = torch.softmax(draft_logits, dim=-1)  # Convert to probabilities
         draft_predictions = torch.argmax(draft_logits, dim=-1)  # [batch, ttt_length, seq_len]
         

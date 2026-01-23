@@ -7,8 +7,13 @@ TARGET_MODEL="Qwen/Qwen2.5-3B-Instruct"
 TRAIN_DATA="./cache/dataset/ultrachat_train.jsonl"
 OUTPUT_DIR="./outputs/eagle3_detailed_logging"
 
+# IMPORTANT: Chat template must match your model!
+# Qwen models use "chatml" template (<|im_start|>, <|im_end|>)
+# Llama models use "llama3" template (<|start_header_id|>, <|eot_id|>)
+# If you see "WARNING: Empty loss_mask", your chat template is wrong!
+
 # Run training with detailed logging enabled
-torchrun nproc_per_node=1 scripts/train_eagle3.py \
+torchrun --nproc_per_node=1 scripts/train_eagle3.py \
   --target-model-path $TARGET_MODEL \
   --train-data-path $TRAIN_DATA \
   --output-dir $OUTPUT_DIR \
@@ -17,6 +22,7 @@ torchrun nproc_per_node=1 scripts/train_eagle3.py \
   --num-epochs 10 \
   --learning-rate 1e-4 \
   --ttt-length 7 \
+  --chat-template chatml \
   --log-interval 50 \
   --log-samples-interval 100 \
   --num-samples-to-log 5 \
@@ -24,7 +30,7 @@ torchrun nproc_per_node=1 scripts/train_eagle3.py \
   --eval-interval 500 \
   --report-to wandb \
   --wandb-project eagle3-training \
-  --wandb-run-name detailed-logging-test \
+  --wandb-name detailed-logging-test \
   --verbose
 
 # Key parameters for detailed logging:
