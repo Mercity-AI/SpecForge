@@ -107,8 +107,8 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--eval-interval", type=int, default=5000)
     training_group.add_argument("--save-interval", type=int, default=5000)
     training_group.add_argument("--log-interval", type=int, default=50)
-    training_group.add_argument("--log-samples-interval", type=int, default=200, help="Log detailed samples every N steps")
-    training_group.add_argument("--num-samples-to-log", type=int, default=5, help="Number of samples to log in detail")
+    training_group.add_argument("--log-samples-interval", type=int, default=None, help="Log detailed samples every N steps (None = end of epoch only)")
+    training_group.add_argument("--num-samples-to-log", type=int, default=2, help="Number of samples to log in detail")
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
 
@@ -395,14 +395,10 @@ def log_detailed_predictions(
     target_model: Optional[Eagle3TargetModel],
     tokenizer: AutoTokenizer,
     global_step: int,
-    tracker: Tracker,
+    epoch: int,
     is_online: bool = True,
 ) -> None:
     """Log detailed predictions to understand drafter improvement"""
-    if wandb is None:
-        print_on_rank0("wandb not available, skipping detailed predictions logging")
-        return
-    
     # Get predictions with detailed outputs
     eagle3_model.eval()
     draft_model = eagle3_model.draft_model if hasattr(eagle3_model, 'draft_model') else eagle3_model.module.draft_model
@@ -570,109 +566,68 @@ def log_detailed_predictions(
                 'predictions': position_logs
             })
         
-        # Log to wandb
-        if dist.get_rank() == 0 and tracker.is_initialized:
-            # Log model internals
-            print_on_rank0(f"\n[Model Internals at step {global_step}]")
+        # Print detailed predictions
+        if dist.get_rank() == 0:
+            # Print model internals
+            print_on_rank0(f"\n{'='*80}")
+            print_on_rank0(f"Epoch {epoch} - Step {global_step} - Detailed Predictions")
+            print_on_rank0(f"{'='*80}")
+            print_on_rank0(f"\n[Model Internals]")
             print_on_rank0(f"  Input shape: {input_ids.shape}")
             print_on_rank0(f"  Hidden states shape: {hidden_states.shape}")
             print_on_rank0(f"  Target shape: {target.shape}")
             print_on_rank0(f"  Loss mask sum: {loss_mask.sum().item()}")
             print_on_rank0(f"  Draft predictions shape: {draft_predictions.shape}")
             
-            # Log hidden states statistics
-            hidden_stats = {
-                'hidden_states/mean': hidden_states.mean().item(),
-                'hidden_states/std': hidden_states.std().item(),
-                'hidden_states/min': hidden_states.min().item(),
-                'hidden_states/max': hidden_states.max().item(),
-            }
-            tracker.log(hidden_stats, step=global_step)
-            
-            # Create a formatted table
-            table_data = []
+            # Collect confidence data for summary
             confidence_data = []
             for sample in log_data:
                 for pred_log in sample['predictions']:
-                    table_data.append([
-                        global_step,
-                        sample['sample'],
-                        sample['context'][:100],
-                        pred_log['position'],
-                        pred_log['accuracy'],
-                        pred_log['predicted'][:100],  # Truncate for readability
-                        pred_log['target'][:100],
-                        pred_log['match'],
-                        pred_log['pred_confidence'],
-                        pred_log['target_confidence']
-                    ])
                     confidence_data.append({
                         'position': pred_log['position'],
                         'pred_conf': float(pred_log['pred_confidence']),
                         'target_conf': float(pred_log['target_confidence'])
                     })
             
-            if table_data:
-                table = wandb.Table(
-                    columns=['step', 'sample', 'context', 'draft_position', 'accuracy', 
-                            'predicted', 'target', 'match', 'pred_conf', 'target_conf'],
-                    data=table_data
-                )
-                tracker.log({'predictions/samples_table': table}, step=global_step)
+            # Print detailed predictions
+            print_on_rank0(f"\n[Predictions]")
+            for sample in log_data:
+                print_on_rank0(f"\n[Sample {sample['sample']}]")
+                print_on_rank0(f"Context: {sample['context'][:200]}...")
+                for pred_log in sample['predictions']:
+                    print_on_rank0(f"\n  Position {pred_log['position']} (Acc: {pred_log['accuracy']}) {pred_log['match']}")
+                    print_on_rank0(f"    Predicted: {pred_log['predicted'][:80]} (conf: {pred_log['pred_confidence']})")
+                    print_on_rank0(f"    Target:    {pred_log['target'][:80]} (conf: {pred_log['target_confidence']})")
+                    
+                    # Highlight if model is confident but wrong, or uncertain but right
+                    pred_conf_val = float(pred_log['pred_confidence'])
+                    target_conf_val = float(pred_log['target_confidence'])
+                    if pred_log['match'] == '✗' and pred_conf_val > 0.7:
+                        print_on_rank0(f"    ⚠️  High confidence in wrong prediction!")
+                    elif pred_log['match'] == '✓' and target_conf_val < 0.3:
+                        print_on_rank0(f"    ⚠️  Low confidence in correct prediction")
+            
+            # Print confidence summary
+            if confidence_data:
+                overall_pred_conf = sum(c['pred_conf'] for c in confidence_data) / len(confidence_data)
+                overall_target_conf = sum(c['target_conf'] for c in confidence_data) / len(confidence_data)
                 
-                # Log average confidence by position
+                print_on_rank0(f"\n[Confidence Summary]")
+                print_on_rank0(f"  Avg confidence in predictions: {overall_pred_conf:.3f}")
+                print_on_rank0(f"  Avg confidence in targets: {overall_target_conf:.3f}")
+                print_on_rank0(f"  Gap (target - pred): {overall_target_conf - overall_pred_conf:.3f}")
+                print_on_rank0(f"  → {'Model improving!' if overall_target_conf > overall_pred_conf else 'Model needs more training'}")
+                
+                # Per-position confidence
+                print_on_rank0(f"\n[Per-Position Confidence]")
                 for pos in range(args.ttt_length):
                     pos_confs = [c for c in confidence_data if c['position'] == pos]
                     if pos_confs:
                         avg_pred_conf = sum(c['pred_conf'] for c in pos_confs) / len(pos_confs)
                         avg_target_conf = sum(c['target_conf'] for c in pos_confs) / len(pos_confs)
-                        tracker.log({
-                            f'predictions/pos_{pos}_pred_confidence': avg_pred_conf,
-                            f'predictions/pos_{pos}_target_confidence': avg_target_conf,
-                        }, step=global_step)
-                
-                # Also log as text for easy reading
-                text_log = f"\n{'='*80}\nStep {global_step} - Detailed Predictions\n{'='*80}\n"
-                text_log += f"\nModel Flow:\n"
-                text_log += f"  1. Target model generates hidden states from input_ids\n"
-                text_log += f"  2. Draft model receives: input_ids + hidden_states\n"
-                text_log += f"  3. Draft model predicts next tokens at {args.ttt_length} positions\n"
-                text_log += f"  4. Predictions compared against target model's outputs\n\n"
-                
-                for sample in log_data:
-                    text_log += f"\n[Sample {sample['sample']}]\n"
-                    text_log += f"Context: {sample['context']}\n"
-                    for pred_log in sample['predictions']:
-                        text_log += f"\n  Position {pred_log['position']} (Acc: {pred_log['accuracy']}) {pred_log['match']}\n"
-                        text_log += f"    Predicted: {pred_log['predicted']} (conf: {pred_log['pred_confidence']})\n"
-                        text_log += f"    Target:    {pred_log['target']} (conf: {pred_log['target_confidence']})\n"
-                        
-                        # Highlight if model is confident but wrong, or uncertain but right
-                        pred_conf_val = float(pred_log['pred_confidence'])
-                        target_conf_val = float(pred_log['target_confidence'])
-                        if pred_log['match'] == '✗' and pred_conf_val > 0.7:
-                            text_log += f"    ⚠️  High confidence in wrong prediction!\n"
-                        elif pred_log['match'] == '✓' and target_conf_val < 0.3:
-                            text_log += f"    ⚠️  Low confidence in correct prediction\n"
-                
-                print_on_rank0(text_log)
-                tracker.log({'predictions/detailed_text': wandb.Html(f"<pre>{text_log}</pre>")}, step=global_step)
-                
-                # Create a summary chart showing improvement over time
-                if confidence_data:
-                    overall_pred_conf = sum(c['pred_conf'] for c in confidence_data) / len(confidence_data)
-                    overall_target_conf = sum(c['target_conf'] for c in confidence_data) / len(confidence_data)
-                    tracker.log({
-                        'predictions/overall_pred_confidence': overall_pred_conf,
-                        'predictions/overall_target_confidence': overall_target_conf,
-                        'predictions/confidence_gap': overall_target_conf - overall_pred_conf,
-                    }, step=global_step)
-                    
-                    print_on_rank0(f"\n[Confidence Summary]")
-                    print_on_rank0(f"  Avg confidence in predictions: {overall_pred_conf:.3f}")
-                    print_on_rank0(f"  Avg confidence in targets: {overall_target_conf:.3f}")
-                    print_on_rank0(f"  Gap (target - pred): {overall_target_conf - overall_pred_conf:.3f}")
-                    print_on_rank0(f"  → {'Model improving!' if overall_target_conf > overall_pred_conf else 'Model needs more training'}\n")
+                        print_on_rank0(f"  Position {pos}: pred={avg_pred_conf:.3f}, target={avg_target_conf:.3f}")
+            
+            print_on_rank0(f"\n{'='*80}\n")
     
     eagle3_model.train()
 
@@ -919,7 +874,10 @@ def main():
 
     # Start training
     print_on_rank0(f"\nStarting training: {args.num_epochs} epochs, eval every {args.eval_interval} steps, save every {args.save_interval} steps\n")
-    print_on_rank0(f"Detailed prediction logging: every {args.log_samples_interval} steps, {args.num_samples_to_log} samples\n")
+    if args.log_samples_interval:
+        print_on_rank0(f"Detailed prediction logging: every {args.log_samples_interval} steps, {args.num_samples_to_log} samples\n")
+    else:
+        print_on_rank0(f"Detailed prediction logging: end of each epoch, {args.num_samples_to_log} samples\n")
 
     for epoch in range(start_epoch, args.num_epochs):
         train_dataloader.sampler.set_epoch(epoch + 1)
@@ -986,11 +944,13 @@ def main():
                     args, acces, plosses, global_step, tracker, optimizer, mode="train"
                 )
             
-            # Log detailed predictions periodically
-            if global_step % args.log_samples_interval == 0 and logging_batch is not None and not args.is_vlm:
-                print_on_rank0(f"\n{'='*80}\nLogging detailed predictions at step {global_step}\n{'='*80}")
+            # Log detailed predictions periodically (if interval specified)
+            if (args.log_samples_interval and 
+                global_step % args.log_samples_interval == 0 and 
+                logging_batch is not None and 
+                not args.is_vlm):
                 log_detailed_predictions(
-                    args, eagle3_model, logging_batch, target_model, tokenizer, global_step, tracker, is_online
+                    args, eagle3_model, logging_batch, target_model, tokenizer, global_step, epoch, is_online
                 )
 
             time_per_step = time.time() - last_time
@@ -1061,6 +1021,13 @@ def main():
             if args.max_num_steps is not None and global_step >= args.max_num_steps:
                 break
 
+        # End-of-epoch logging
+        if not args.log_samples_interval and logging_batch is not None and not args.is_vlm:
+            print_on_rank0(f"\n[End of Epoch {epoch} - Detailed Predictions]")
+            log_detailed_predictions(
+                args, eagle3_model, logging_batch, target_model, tokenizer, global_step, epoch, is_online
+            )
+        
         # End-of-epoch checkpoint
         print_on_rank0(f"\n[End of Epoch {epoch} - Checkpoint @ step {global_step}]")
         save_checkpoints(args, epoch, global_step, eagle3_model, optimizer)

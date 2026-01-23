@@ -24,36 +24,33 @@ torchrun --nproc_per_node=1 scripts/train_eagle3.py \
   --ttt-length 7 \
   --chat-template chatml \
   --log-interval 50 \
-  --log-samples-interval 100 \
-  --num-samples-to-log 5 \
+  --num-samples-to-log 2 \
   --save-interval 1000 \
   --eval-interval 500 \
-  --report-to wandb \
-  --wandb-project eagle3-training \
-  --wandb-name detailed-logging-test \
   --verbose
 
+# Note: Removed --log-samples-interval so it logs at end of each epoch
+# Note: --num-samples-to-log set to 2 for concise output
+# Note: Removed WandB (--report-to, --wandb-project, --wandb-name)
+
 # Key parameters for detailed logging:
-# --log-samples-interval 200  : Log detailed predictions every 200 steps
-# --num-samples-to-log 5      : Log 5 samples each time
-# --verbose                   : Enable verbose debug output
-# --report-to wandb           : Use Weights & Biases for logging
+# --num-samples-to-log 2        : Log 2 samples at end of each epoch
+# --log-samples-interval N      : Optional - log every N steps (omit for end-of-epoch only)
+# --verbose                     : Enable verbose debug output
+# --chat-template chatml        : IMPORTANT - must match your model!
 
-# What gets logged:
-# 1. Prediction tables showing drafter vs target for each draft position
-# 2. Confidence scores (how confident the model is in its predictions)
-# 3. Hidden state statistics
-# 4. Token-level comparisons with decoded text
-# 5. Improvement metrics (confidence gap over time)
-# 6. Per-position accuracy trends
+# What gets logged (printed to console):
+# 1. Model internals (tensor shapes, loss mask sum)
+# 2. Token-by-token predictions vs targets for each draft position
+# 3. Confidence scores (how confident the model is in predictions)
+# 4. Per-position accuracy and confidence
+# 5. Overall confidence gap (are we learning?)
+# 6. Warnings for confident-but-wrong predictions
 
-# In WandB, you'll see:
-# - predictions/samples_table: Table with all predictions
-# - predictions/detailed_text: Formatted text log
-# - predictions/pos_X_pred_confidence: Confidence at each position
-# - predictions/pos_X_target_confidence: Target confidence at each position
-# - predictions/overall_pred_confidence: Overall prediction confidence
-# - predictions/overall_target_confidence: Overall target confidence
-# - predictions/confidence_gap: Gap between target and prediction confidence
-# - hidden_states/mean, std, min, max: Hidden state statistics
+# The output shows:
+# - Context text being completed
+# - What the drafter predicts at each position (0 to ttt_length-1)
+# - What the target model actually outputs
+# - Confidence scores for both
+# - Whether predictions match (✓/✗)
 
