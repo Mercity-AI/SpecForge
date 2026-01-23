@@ -24,6 +24,11 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -102,6 +107,8 @@ def parse_args() -> Tuple[ArgumentParser, Namespace]:
     training_group.add_argument("--eval-interval", type=int, default=5000)
     training_group.add_argument("--save-interval", type=int, default=5000)
     training_group.add_argument("--log-interval", type=int, default=50)
+    training_group.add_argument("--log-samples-interval", type=int, default=200, help="Log detailed samples every N steps")
+    training_group.add_argument("--num-samples-to-log", type=int, default=5, help="Number of samples to log in detail")
     training_group.add_argument("--seed", type=int, default=0)
     training_group.add_argument("--draft-accumulation-steps", type=int, default=1)
 
@@ -381,6 +388,256 @@ def save_checkpoints(
         dist.barrier()
 
 
+def log_detailed_predictions(
+    args: Namespace,
+    eagle3_model: nn.Module,
+    data: dict,
+    target_model: Optional[Eagle3TargetModel],
+    tokenizer: AutoTokenizer,
+    global_step: int,
+    tracker: Tracker,
+    is_online: bool = True,
+) -> None:
+    """Log detailed predictions to understand drafter improvement"""
+    if wandb is None:
+        print_on_rank0("wandb not available, skipping detailed predictions logging")
+        return
+    
+    # Get predictions with detailed outputs
+    eagle3_model.eval()
+    draft_model = eagle3_model.draft_model if hasattr(eagle3_model, 'draft_model') else eagle3_model.module.draft_model
+    
+    with torch.no_grad():
+        if args.is_vlm:
+            # For VLM, we'll skip detailed logging for now
+            return
+        
+        if is_online:
+            eagle3_data = target_model.generate_eagle3_data(
+                input_ids=data["input_ids"].cuda(),
+                attention_mask=data["attention_mask"].cuda(),
+                loss_mask=data["loss_mask"].cuda(),
+            )
+            
+            input_ids = get_dp_data_shard_from_tp(eagle3_data.input_ids)
+            attention_mask = get_dp_data_shard_from_tp(eagle3_data.attention_mask)
+            loss_mask = get_dp_data_shard_from_tp(eagle3_data.loss_mask)
+            target = get_dp_data_shard_from_tp(eagle3_data.target)
+            hidden_states = get_dp_data_shard_from_tp(eagle3_data.hidden_states)
+        else:
+            input_ids = data["input_ids"].cuda()
+            attention_mask = data["attention_mask"].cuda()
+            loss_mask = data["loss_mask"].cuda()
+            hidden_states = data["hidden_state"].cuda()
+            target = target_model(data["target"].cuda())
+            input_ids, target, loss_mask = target_model.preprocess(
+                input_ids, target, loss_mask
+            )
+        
+        # Get draft model predictions
+        draft_outputs = draft_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            hidden_states=hidden_states,
+        )
+        
+        # Get predictions for each position
+        draft_logits = draft_outputs.logits  # Shape: [batch, ttt_length, seq_len, vocab_size]
+        draft_probs = torch.softmax(draft_logits, dim=-1)  # Convert to probabilities
+        draft_predictions = torch.argmax(draft_logits, dim=-1)  # [batch, ttt_length, seq_len]
+        
+        # Prepare logging data
+        num_samples = min(args.num_samples_to_log, input_ids.shape[0])
+        log_data = []
+        
+        for sample_idx in range(num_samples):
+            sample_input_ids = input_ids[sample_idx]
+            sample_loss_mask = loss_mask[sample_idx]
+            sample_target = target[sample_idx]
+            sample_draft_preds = draft_predictions[sample_idx]
+            
+            # Find non-padded positions
+            valid_positions = sample_loss_mask.nonzero(as_tuple=True)[0]
+            if len(valid_positions) == 0:
+                continue
+            
+            # Get a window of tokens to log (not the entire sequence)
+            start_pos = max(0, valid_positions[0].item() - 10)
+            end_pos = min(len(sample_input_ids), valid_positions[-1].item() + 10)
+            
+            # Decode input context
+            context_tokens = sample_input_ids[start_pos:end_pos]
+            context_text = tokenizer.decode(context_tokens, skip_special_tokens=False)
+            
+            # Log predictions for each draft position
+            position_logs = []
+            for ttt_idx in range(min(args.ttt_length, draft_predictions.shape[1])):
+                # Get predictions at this TTT position
+                ttt_preds = sample_draft_preds[ttt_idx]
+                ttt_targets = sample_target[ttt_idx] if target.dim() > 2 else sample_target
+                ttt_probs = draft_probs[sample_idx, ttt_idx]  # Probabilities for this position
+                
+                # Find valid prediction positions
+                valid_pred_positions = valid_positions[valid_positions < len(ttt_preds)]
+                if len(valid_pred_positions) == 0:
+                    continue
+                
+                # Take a few positions to log
+                positions_to_show = valid_pred_positions[:min(20, len(valid_pred_positions))]
+                
+                pred_tokens = ttt_preds[positions_to_show]
+                target_tokens = ttt_targets[positions_to_show]
+                
+                # Get confidence scores
+                pred_confidences = []
+                target_confidences = []
+                for pos_idx, pos in enumerate(positions_to_show):
+                    pred_token = pred_tokens[pos_idx].item()
+                    target_token = target_tokens[pos_idx].item()
+                    
+                    # Get probability of predicted token
+                    pred_conf = ttt_probs[pos, pred_token].item()
+                    pred_confidences.append(pred_conf)
+                    
+                    # Get probability assigned to target token
+                    target_conf = ttt_probs[pos, target_token].item()
+                    target_confidences.append(target_conf)
+                
+                avg_pred_conf = sum(pred_confidences) / len(pred_confidences) if pred_confidences else 0
+                avg_target_conf = sum(target_confidences) / len(target_confidences) if target_confidences else 0
+                
+                # Calculate accuracy
+                correct = (pred_tokens == target_tokens).sum().item()
+                total = len(positions_to_show)
+                accuracy = correct / total if total > 0 else 0
+                
+                # Decode predictions and targets
+                pred_text = tokenizer.decode(pred_tokens, skip_special_tokens=False)
+                target_text = tokenizer.decode(target_tokens, skip_special_tokens=False)
+                
+                position_logs.append({
+                    'position': ttt_idx,
+                    'accuracy': f"{accuracy:.2%}",
+                    'predicted': pred_text,
+                    'target': target_text,
+                    'match': '✓' if pred_text == target_text else '✗',
+                    'pred_confidence': f"{avg_pred_conf:.3f}",
+                    'target_confidence': f"{avg_target_conf:.3f}"
+                })
+            
+            log_data.append({
+                'sample': sample_idx,
+                'context': context_text[:200] + '...' if len(context_text) > 200 else context_text,
+                'predictions': position_logs
+            })
+        
+        # Log to wandb
+        if dist.get_rank() == 0 and tracker.is_initialized:
+            # Log model internals
+            print_on_rank0(f"\n[Model Internals at step {global_step}]")
+            print_on_rank0(f"  Input shape: {input_ids.shape}")
+            print_on_rank0(f"  Hidden states shape: {hidden_states.shape}")
+            print_on_rank0(f"  Target shape: {target.shape}")
+            print_on_rank0(f"  Loss mask sum: {loss_mask.sum().item()}")
+            print_on_rank0(f"  Draft predictions shape: {draft_predictions.shape}")
+            
+            # Log hidden states statistics
+            hidden_stats = {
+                'hidden_states/mean': hidden_states.mean().item(),
+                'hidden_states/std': hidden_states.std().item(),
+                'hidden_states/min': hidden_states.min().item(),
+                'hidden_states/max': hidden_states.max().item(),
+            }
+            tracker.log(hidden_stats, step=global_step)
+            
+            # Create a formatted table
+            table_data = []
+            confidence_data = []
+            for sample in log_data:
+                for pred_log in sample['predictions']:
+                    table_data.append([
+                        global_step,
+                        sample['sample'],
+                        sample['context'][:100],
+                        pred_log['position'],
+                        pred_log['accuracy'],
+                        pred_log['predicted'][:100],  # Truncate for readability
+                        pred_log['target'][:100],
+                        pred_log['match'],
+                        pred_log['pred_confidence'],
+                        pred_log['target_confidence']
+                    ])
+                    confidence_data.append({
+                        'position': pred_log['position'],
+                        'pred_conf': float(pred_log['pred_confidence']),
+                        'target_conf': float(pred_log['target_confidence'])
+                    })
+            
+            if table_data:
+                table = wandb.Table(
+                    columns=['step', 'sample', 'context', 'draft_position', 'accuracy', 
+                            'predicted', 'target', 'match', 'pred_conf', 'target_conf'],
+                    data=table_data
+                )
+                tracker.log({'predictions/samples_table': table}, step=global_step)
+                
+                # Log average confidence by position
+                for pos in range(args.ttt_length):
+                    pos_confs = [c for c in confidence_data if c['position'] == pos]
+                    if pos_confs:
+                        avg_pred_conf = sum(c['pred_conf'] for c in pos_confs) / len(pos_confs)
+                        avg_target_conf = sum(c['target_conf'] for c in pos_confs) / len(pos_confs)
+                        tracker.log({
+                            f'predictions/pos_{pos}_pred_confidence': avg_pred_conf,
+                            f'predictions/pos_{pos}_target_confidence': avg_target_conf,
+                        }, step=global_step)
+                
+                # Also log as text for easy reading
+                text_log = f"\n{'='*80}\nStep {global_step} - Detailed Predictions\n{'='*80}\n"
+                text_log += f"\nModel Flow:\n"
+                text_log += f"  1. Target model generates hidden states from input_ids\n"
+                text_log += f"  2. Draft model receives: input_ids + hidden_states\n"
+                text_log += f"  3. Draft model predicts next tokens at {args.ttt_length} positions\n"
+                text_log += f"  4. Predictions compared against target model's outputs\n\n"
+                
+                for sample in log_data:
+                    text_log += f"\n[Sample {sample['sample']}]\n"
+                    text_log += f"Context: {sample['context']}\n"
+                    for pred_log in sample['predictions']:
+                        text_log += f"\n  Position {pred_log['position']} (Acc: {pred_log['accuracy']}) {pred_log['match']}\n"
+                        text_log += f"    Predicted: {pred_log['predicted']} (conf: {pred_log['pred_confidence']})\n"
+                        text_log += f"    Target:    {pred_log['target']} (conf: {pred_log['target_confidence']})\n"
+                        
+                        # Highlight if model is confident but wrong, or uncertain but right
+                        pred_conf_val = float(pred_log['pred_confidence'])
+                        target_conf_val = float(pred_log['target_confidence'])
+                        if pred_log['match'] == '✗' and pred_conf_val > 0.7:
+                            text_log += f"    ⚠️  High confidence in wrong prediction!\n"
+                        elif pred_log['match'] == '✓' and target_conf_val < 0.3:
+                            text_log += f"    ⚠️  Low confidence in correct prediction\n"
+                
+                print_on_rank0(text_log)
+                tracker.log({'predictions/detailed_text': wandb.Html(f"<pre>{text_log}</pre>")}, step=global_step)
+                
+                # Create a summary chart showing improvement over time
+                if confidence_data:
+                    overall_pred_conf = sum(c['pred_conf'] for c in confidence_data) / len(confidence_data)
+                    overall_target_conf = sum(c['target_conf'] for c in confidence_data) / len(confidence_data)
+                    tracker.log({
+                        'predictions/overall_pred_confidence': overall_pred_conf,
+                        'predictions/overall_target_confidence': overall_target_conf,
+                        'predictions/confidence_gap': overall_target_conf - overall_pred_conf,
+                    }, step=global_step)
+                    
+                    print_on_rank0(f"\n[Confidence Summary]")
+                    print_on_rank0(f"  Avg confidence in predictions: {overall_pred_conf:.3f}")
+                    print_on_rank0(f"  Avg confidence in targets: {overall_target_conf:.3f}")
+                    print_on_rank0(f"  Gap (target - pred): {overall_target_conf - overall_pred_conf:.3f}")
+                    print_on_rank0(f"  → {'Model improving!' if overall_target_conf > overall_pred_conf else 'Model needs more training'}\n")
+    
+    eagle3_model.train()
+
+
 def run_forward(
     args: Namespace,
     eagle3_model: nn.Module,
@@ -550,11 +807,14 @@ def main():
     draft_model_config, draft_model = build_draft_model(args)
     target_model, processor = build_target_model(args, draft_model_config, is_online)
 
-    # Build dataloaders
+    # Build dataloaders and tokenizer for logging
     train_dataloader, vocab_mapping_path, eval_dataloader = build_dataloaders(
         args, draft_model_config, processor
     )
     draft_model.load_vocab_mapping(vocab_mapping_path)
+    
+    # Keep tokenizer for detailed logging
+    tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
     
     print_on_rank0(f"Data: {len(train_dataloader.dataset):,} samples, {len(train_dataloader)} steps/epoch")
     if eval_dataloader is not None:
@@ -614,9 +874,13 @@ def main():
     dist.barrier()
 
     last_time = time.time()
+    
+    # Store a fixed batch for consistent detailed logging
+    logging_batch = None
 
     # Start training
     print_on_rank0(f"\nStarting training: {args.num_epochs} epochs, eval every {args.eval_interval} steps, save every {args.save_interval} steps\n")
+    print_on_rank0(f"Detailed prediction logging: every {args.log_samples_interval} steps, {args.num_samples_to_log} samples\n")
 
     for epoch in range(start_epoch, args.num_epochs):
         train_dataloader.sampler.set_epoch(epoch + 1)
@@ -631,6 +895,11 @@ def main():
 
         for data in progress_bar:
             global_step += 1
+            
+            # Store first batch for consistent detailed logging
+            if logging_batch is None and not args.is_vlm:
+                logging_batch = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+                print_on_rank0(f"Captured logging batch with {logging_batch['input_ids'].shape[0]} samples")
 
             # Check for empty loss masks
             if "loss_mask" in data:
@@ -676,6 +945,13 @@ def main():
             if global_step % args.log_interval == 0:
                 record_metrcs(
                     args, acces, plosses, global_step, tracker, optimizer, mode="train"
+                )
+            
+            # Log detailed predictions periodically
+            if global_step % args.log_samples_interval == 0 and logging_batch is not None and not args.is_vlm:
+                print_on_rank0(f"\n{'='*80}\nLogging detailed predictions at step {global_step}\n{'='*80}")
+                log_detailed_predictions(
+                    args, eagle3_model, logging_batch, target_model, tokenizer, global_step, tracker, is_online
                 )
 
             time_per_step = time.time() - last_time

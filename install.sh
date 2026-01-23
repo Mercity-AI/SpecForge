@@ -1,4 +1,3 @@
-
 apt update
 apt install libnuma1 numactl
 
