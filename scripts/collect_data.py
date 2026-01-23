@@ -153,7 +153,7 @@ def get_dataset_and_proc_fn(name: str):
         return ds, process_science_qna_row
         
     elif name == "soda":
-        ds = load_dataset("agentlans/combined-roleplay", "multiturn_mix_v3_k30000", split="train", streaming=True)
+        ds = load_dataset("agentlans/combined-roleplay", "soda", split="train", streaming=True)
         return ds, process_roleplay_row
         
     elif name == "lmsys":
