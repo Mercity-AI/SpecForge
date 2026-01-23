@@ -462,7 +462,7 @@ def log_detailed_predictions(
             inputs_embeds = draft_model.embed_input_ids(input_ids)
             inputs_embeds = inputs_embeds.to(hidden_states_step.dtype)
             
-            # Run backbone
+            # Run backbone (use_cache=False for logging since we don't need KV cache)
             hidden_states_out = draft_model.backbone(
                 input_embeds=inputs_embeds,
                 hidden_states=hidden_states_step,
@@ -470,7 +470,7 @@ def log_detailed_predictions(
                 attention_mask=decoder_attention_mask,
                 position_ids=position_ids,
                 past_key_values=None,
-                use_cache=True,
+                use_cache=False,
             )
             
             # Compute logits
