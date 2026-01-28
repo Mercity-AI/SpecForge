@@ -5,6 +5,7 @@ pip install uv
 
 git clone https://github.com/Mercity-AI/SpecForge.git
 cd SpecForge
+git checkout pranav/fixes
 
 # create a new virtual environment
 uv venv -p 3.11
@@ -13,10 +14,11 @@ source .venv/bin/activate
 # install specforge
 uv pip install -v . --prerelease=allow
 
+## datset scripts
+python scripts/prepare_data.py --sample-size 1500 --split-eval --dataset ultrachat
 python scripts/collect_data.py --sample-size 150000 --split-eval --eval-ratio 0.05
 
-torchrun --nproc_per_node=2 scripts/train_eagle3.py   --target-model-path Qwen/Qwen2.5-7B-Instruct   --train-data-path ./cache/dataset/train.jsonl   --eval-data-path ./cache/dataset/eval.jsonl   --output-dir ./outputs/eagle3-mla   --attention-backend flex_attention_mla   --batch-size 8   --max-length 1024   --num-epochs 3   --learning-rate 1e-4   --ttt-leng
-th 7   --save-interval 10000   --eval-interval 1000   --log-interval 50   --chat-template qwen   --report-to wandb
+torchrun --nproc_per_node=2 scripts/train_eagle3.py   --target-model-path Qwen/Qwen2.5-7B-Instruct   --train-data-path ./cache/dataset/train.jsonl   --eval-data-path ./cache/dataset/eval.jsonl   --output-dir ./outputs/eagle3-mla   --attention-backend flex_attention_mla   --batch-size 8   --max-length 1024   --num-epochs 3   --learning-rate 1e-4   --ttt-length 7   --save-interval 10000   --eval-interval 1000   --log-interval 50   --chat-template qwen   --report-to wandb
 
 # ==============================================================================
 # EVALUATION SCRIPTS
